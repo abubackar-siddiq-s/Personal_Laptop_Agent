@@ -6,6 +6,9 @@ from app.planner import task_executor, task_scheduler
 from app.tools.native import register
 from app.tools.mcp_manager import mcp
 from app.browser import browser, register_browser_tools
+from app.desktop import register_desktop_tools
+from app.vision import register_vision_tools
+from app.files import register_file_tools
 from app.api.routes import r
 
 app = FastAPI(title="LAPTOP AI API", version="0.5.0")
@@ -26,6 +29,9 @@ async def start():
     task_scheduler.recover_interrupted_schedules()
     register()
     register_browser_tools()
+    register_desktop_tools()
+    register_vision_tools()
+    register_file_tools()
     await mcp.load_all_enabled()
     task_scheduler.start()
 

@@ -6,21 +6,21 @@ from typing import Any
 # Provider token limits and context budgets
 PROVIDER_LIMITS: dict[str, dict[str, int]] = {
     "groq": {
-        "max_context_tokens": 3200,      # Strict budget to comfortably stay under 8,000 TPM
+        "max_context_tokens": 4096,      # Token budget staying safely within Groq TPM limits
         "max_output_tokens": 1024,       # Limits reserved completion tokens against TPM
-        "max_tool_chars": 2500,          # Bound tool output for text-only / low TPM models
+        "max_tool_chars": 8000,          # Bound tool output: 8,000 chars comfortably fits 30-45 UI elements without clipping
         "max_history_turns": 4,          # Retain up to 4 recent message turns
     },
     "gemini": {
         "max_context_tokens": 64000,     # Generous context (Gemini 2.5 Flash has 1M TPM)
         "max_output_tokens": 2048,
-        "max_tool_chars": 12000,
+        "max_tool_chars": 16000,
         "max_history_turns": 10,
     },
     "openrouter": {
         "max_context_tokens": 10000,
         "max_output_tokens": 1500,
-        "max_tool_chars": 6000,
+        "max_tool_chars": 8000,
         "max_history_turns": 6,
     },
 }
@@ -229,17 +229,44 @@ def filter_relevant_tools(
         "tab", "click", "fill", "type", "link", "download", "pdf", "html",
         "navigate", "google", "duckduckgo", "button", "screenshot", "scroll"
     }
+    desktop_keywords = {
+        "window", "windows", "hwnd", "application", "active", "foreground",
+        "minimized", "maximized", "dimensions", "title", "focus", "switch",
+        "desktop", "screen", "screenshot", "ui", "element", "button", "controls",
+        "click", "scroll", "type", "press", "shortcut", "shortcuts", "hotkey", "mouse", "keyboard"
+    }
+    vision_keywords = {
+        "screen", "display", "visual", "vision", "see", "look", "watch",
+        "ocr", "text", "read", "button", "find", "locate", "where",
+        "compare", "difference", "changed", "change", "region", "error",
+        "warning", "dialog", "address", "bar", "what is displayed", "what is on"
+    }
+    files_keywords = {
+        "file", "files", "document", "documents", "pdf", "docx", "doc", "xlsx", "xls",
+        "pptx", "ppt", "csv", "txt", "markdown", "md", "json", "xml", "html", "rtf",
+        "spreadsheet", "spreadsheets", "excel", "sheets", "summarize", "summary",
+        "ask", "compare", "search", "semantic", "index", "duplicate", "duplicates",
+        "organize", "cleanup", "quarantine", "extract", "profile"
+    }
     system_keywords = {
         "cpu", "ram", "memory", "battery", "disk", "hardware", "process",
         "processes", "kill", "terminate", "inspect", "file", "folder",
-        "documents", "downloads", "desktop", "notepad", "calc", "launch",
-        "terminal", "diagnostic", "whoami", "ipconfig", "screen", "capture"
+        "documents", "downloads", "notepad", "calc", "launch",
+        "terminal", "diagnostic", "whoami", "ipconfig"
     }
     mcp_keywords = {"mcp", "server", "servers"}
     approval_keywords = {"approval", "approve", "pending", "permission"}
 
     wants_browser = bool(words & browser_keywords) or any(k in text_corpus for k in ("http://", "https://"))
-    wants_system = bool(words & system_keywords) and not (words & {"screenshot", "page", "web", "browser"} and words & {"screen"})
+    wants_desktop = bool(words & desktop_keywords)
+    wants_vision = bool(words & vision_keywords) or any(
+        k in text_corpus for k in (
+            "what is on my screen", "what is displayed", "where is", "find the",
+            "locate", "extract text", "compare screenshot", "explain what is happening"
+        )
+    )
+    wants_files = bool(words & files_keywords)
+    wants_system = bool(words & system_keywords)
     wants_mcp = bool(words & mcp_keywords)
     wants_approval = bool(words & approval_keywords)
 
@@ -258,7 +285,96 @@ def filter_relevant_tools(
             selected.append(t)
             continue
 
-        if wants_browser and not wants_system:
+        # Vision Tools Scoping
+        if fn_name.startswith("vision_screen_"):
+            if wants_vision or wants_desktop:
+                if fn_name == "vision_screen_analyze" and any(k in text_corpus for k in ("what", "display", "screen", "see", "look", "analyze", "describe", "happen", "explain", "using")):
+                    selected.append(t)
+                    continue
+                if fn_name == "vision_screen_extract_text" and any(k in text_corpus for k in ("text", "ocr", "read", "extract", "words", "label")):
+                    selected.append(t)
+                    continue
+                if fn_name == "vision_screen_find_element" and any(k in text_corpus for k in ("find", "locate", "where", "button", "bar", "dialog", "element")):
+                    selected.append(t)
+                    continue
+                if fn_name == "vision_screen_compare" and any(k in text_corpus for k in ("compare", "diff", "difference", "change", "changed", "previous")):
+                    selected.append(t)
+                    continue
+                if fn_name == "vision_screen_describe_region" and any(k in text_corpus for k in ("region", "area", "box", "portion", "part")):
+                    selected.append(t)
+                    continue
+                if wants_vision:
+                    selected.append(t)
+                    continue
+
+        # Files & Document Intelligence Scoping
+        if fn_name.startswith("files_"):
+            if wants_files:
+                if fn_name == "files_document_extract" and any(k in text_corpus for k in ("extract", "read", "content", "open", "text", "doc", "pdf", "file")):
+                    selected.append(t)
+                    continue
+                if fn_name == "files_document_summarize" and any(k in text_corpus for k in ("summary", "summarize", "key", "points", "takeaways", "overview")):
+                    selected.append(t)
+                    continue
+                if fn_name == "files_document_ask" and any(k in text_corpus for k in ("ask", "question", "what", "where", "how", "citation", "reference")):
+                    selected.append(t)
+                    continue
+                if fn_name == "files_document_compare" and any(k in text_corpus for k in ("compare", "diff", "difference", "versus", "vs")):
+                    selected.append(t)
+                    continue
+                if fn_name in ("files_search_semantic", "files_search_content") and any(k in text_corpus for k in ("search", "find", "locate", "query", "mention")):
+                    selected.append(t)
+                    continue
+                if fn_name in ("files_index_status", "files_index_refresh") and any(k in text_corpus for k in ("index", "refresh", "status", "reindex")):
+                    selected.append(t)
+                    continue
+                if fn_name == "files_spreadsheet_analyze" and any(k in text_corpus for k in ("spreadsheet", "excel", "sheets", "xlsx", "csv", "table", "profile", "formula", "stats")):
+                    selected.append(t)
+                    continue
+                if fn_name == "files_duplicates_find" and any(k in text_corpus for k in ("duplicate", "duplicates", "clone", "wasted")):
+                    selected.append(t)
+                    continue
+                if fn_name in ("files_organize_preview", "files_organize_execute") and any(k in text_corpus for k in ("organize", "cleanup", "quarantine", "move", "large", "old", "empty")):
+                    selected.append(t)
+                    continue
+                selected.append(t)
+                continue
+
+        # Desktop Tools Scoping
+        if wants_desktop:
+            # Core inspection tools for active window and window telemetry
+            if fn_name == "desktop_window_active" and (
+                any(k in text_corpus for k in ("active", "current", "foreground", "title", "hwnd", "pid", "dimension", "minimized", "window", "application", "app"))
+                or not wants_browser
+            ):
+                selected.append(t)
+                continue
+            if fn_name == "desktop_window_list" and any(k in text_corpus for k in ("list", "windows", "open", "all", "running", "visible", "apps", "applications", "switch", "focus")):
+                selected.append(t)
+                continue
+            if fn_name == "desktop_window_focus" and any(k in text_corpus for k in ("focus", "switch", "bring", "activate", "foreground")):
+                selected.append(t)
+                continue
+            if fn_name == "desktop_screen_capture" and any(k in text_corpus for k in ("screen", "screenshot", "capture", "display", "image", "look", "see", "vision")):
+                selected.append(t)
+                continue
+            if fn_name == "desktop_ui_inspect" and any(k in text_corpus for k in ("ui", "element", "inspect", "control", "button", "find", "menu", "tab")):
+                selected.append(t)
+                continue
+            if fn_name == "desktop_mouse_click" and "click" in text_corpus and not wants_browser:
+                selected.append(t)
+                continue
+            if fn_name == "desktop_mouse_scroll" and "scroll" in text_corpus and not wants_browser:
+                selected.append(t)
+                continue
+            if fn_name == "desktop_keyboard_type" and any(k in text_corpus for k in ("type", "write", "input", "enter text")) and not wants_browser:
+                selected.append(t)
+                continue
+            if fn_name == "desktop_keyboard_press" and any(k in text_corpus for k in ("press", "key", "shortcut", "hotkey")) and not wants_browser:
+                selected.append(t)
+                continue
+
+        if wants_browser and not wants_system and not (wants_desktop and any(k in text_corpus for k in ("window", "windows", "desktop", "hwnd", "active"))):
             # High-priority core browser suite
             core_browser = {
                 "browser_open", "browser_navigate", "browser_click", "browser_fill",
@@ -299,11 +415,11 @@ def filter_relevant_tools(
         else:
             # Mixed or ambiguous query: provide balanced top-utility subset
             balanced_subset = {
+                "desktop_window_active", "desktop_window_list", "desktop_screen_capture",
                 "browser_open", "browser_navigate", "browser_get_text", "browser_click",
                 "browser_screenshot", "browser_search",
                 "native_system_overview", "native_system_processes", "native_files_search",
-                "native_files_read", "native_app_launch", "native_terminal_diagnostic",
-                "native_screen_capture"
+                "native_files_read", "native_app_launch", "native_terminal_diagnostic"
             }
             if fn_name in balanced_subset:
                 selected.append(t)

@@ -28,14 +28,20 @@ from app.core.conversation_intelligence import get_injected_memory_context
 
 logger = logging.getLogger("laptop_ai.agent")
 
-# Concise, high-density system instruction (~200 tokens)
+# Concise, high-density system instruction (~240 tokens)
 DEFAULT_SYSTEM_PROMPT = (
     "You are LAPTOP AI, an intelligent personal AI assistant running locally on the user's Windows machine.\n"
-    "You have access to native Windows tools, browser automation, and MCP tools.\n"
+    "You have access to native Windows tools, desktop control tools (active window, window listing, focus, screenshots, UI inspection, mouse, keyboard), browser automation, and MCP tools.\n"
     "Rules:\n"
-    "- Always choose and invoke tools for real machine telemetry, process info, files, browsing, search, and diagnostics.\n"
+    "- Always choose and invoke tools for real machine telemetry, active window info, files, browsing, search, and diagnostics.\n"
+    "- For questions about the user's desktop, active application, window title, process, PID, HWND, dimensions, or visible windows, invoke the corresponding desktop tools (desktop.window.active, desktop.window.list, desktop.screen.capture, desktop.ui.inspect).\n"
+    "- For visual questions about what is displayed on screen, visual layout, finding buttons/elements, extracting text/OCR, or comparing screenshots, invoke the visual intelligence tools (vision.screen.analyze, vision.screen.extract_text, vision.screen.find_element, vision.screen.compare, vision.screen.describe_region).\n"
+    "- For questions about files, documents (PDF, Word, Excel, PowerPoint, CSV, Markdown, text), reading, summarizing, comparing, or answering document questions with verified citations, invoke file intelligence tools (files.document.extract, files.document.summarize, files.document.ask, files.document.compare).\n"
+    "- For semantic or full-text file search, invoke files.search.semantic or files.search.content. For spreadsheet data profiling and analysis, invoke files.spreadsheet.analyze. For duplicate detection and file reorganization, invoke files.duplicates.find or files.organize.preview.\n"
+    "- When inspecting UI elements, report exact counts directly from the tool's 'counts' dictionary (elements_returned, total_descendants, visible_descendants, interactive_descendants, matched_descendants). Never estimate or invent element numbers.\n"
+    "- In response tables or listings, include every returned element provided by the tool without skipping or summarizing.\n"
     "- Never invent or hallucinate metrics, files, or execution results.\n"
-    "- When an action requires user approval (launching apps, terminal commands, browser click/fill), invoke the tool directly; the security gate intercepts and queues it.\n"
+    "- When an action requires user approval (launching apps, terminal commands, browser click/fill, desktop focus/click/type/shortcuts), invoke the tool directly; the security gate intercepts and queues it.\n"
     "- If a tool call is queued for approval, inform the user clearly of the approval ID.\n"
     "- MANDATORY: After executing browser operations, web searches, or file downloads, summarize results clearly in your response. Never return an empty message.\n"
     "- When downloading files/PDFs, report filename, size, and destination (Downloads/LAPTOP_AI).\n"
@@ -44,21 +50,47 @@ DEFAULT_SYSTEM_PROMPT = (
 )
 
 
-def sanitize_tool_result_for_llm(result: any, max_chars: int = 2500) -> str:
+def sanitize_tool_result_for_llm(result: any, max_chars: int = 8000) -> str:
     """
     Format and bound tool output for LLM message history.
     Omit raw binary base64 strings to prevent token and context blowout on Groq and Gemini.
-    Truncate oversized outputs cleanly with notices.
+    Safely bound oversized outputs without breaking JSON or omitting elements unexpectedly.
     """
     if isinstance(result, dict):
         cleaned = dict(result)
+        # Omit large base64 image data
         for k in list(cleaned.keys()):
             if "base64" in k.lower() and isinstance(cleaned[k], str) and len(cleaned[k]) > 100:
                 cleaned[k] = "<base64 image payload omitted from LLM context; image saved on disk>"
+
+        # Structured list pruning if payload exceeds character budget
+        if "elements" in cleaned and isinstance(cleaned["elements"], list):
+            s = json.dumps(cleaned, separators=(", ", ": "), default=str)
+            if len(s) > max_chars:
+                elems = list(cleaned["elements"])
+                orig_len = len(elems)
+                while elems and len(s) > max_chars:
+                    elems.pop()
+                    cleaned["elements"] = elems
+                    cleaned["elements_count"] = len(elems)
+                    if "counts" in cleaned and isinstance(cleaned["counts"], dict):
+                        cleaned["counts"]["elements_returned"] = len(elems)
+                        cleaned["counts"]["elements_omitted"] = max(
+                            0, cleaned["counts"].get("matched_descendants", orig_len) - len(elems)
+                        )
+                    cleaned["truncated"] = True
+                    cleaned["context_budget_truncated"] = True
+                    cleaned["context_budget_notice"] = (
+                        f"Element list safely pruned from {orig_len} to {len(elems)} items to fit within context budget."
+                    )
+                    s = json.dumps(cleaned, separators=(", ", ": "), default=str)
+                return s
+            return s
+
         s = json.dumps(cleaned, indent=2, default=str)
     elif isinstance(result, list):
         cleaned_list = []
-        for item in result[:15]:
+        for item in result[:25]:
             if isinstance(item, dict):
                 ci = dict(item)
                 for k in list(ci.keys()):
@@ -120,6 +152,14 @@ class AgentEngine:
         Run the structured agent loop with preflight token budgeting,
         rate-limit backoff, and intelligent fallback handling.
         """
+        # Ensure tools are registered even in standalone test environments
+        if "desktop.window.active" not in registry.items:
+            try:
+                from app.desktop import register_desktop_tools
+                register_desktop_tools()
+            except Exception:
+                pass
+
         conversation_history = conversation_history or []
         executions: list[ToolExecutionRecord] = []
 
@@ -184,6 +224,7 @@ class AgentEngine:
                                 history=compacted_history,
                                 executions=executions,
                                 conversation_id=conversation_id,
+                                system_prompt=active_system_prompt,
                             )
                         else:
                             res = await self._run_openai_loop(
@@ -193,6 +234,7 @@ class AgentEngine:
                                 history=compacted_history,
                                 executions=executions,
                                 conversation_id=conversation_id,
+                                system_prompt=active_system_prompt,
                             )
                         res.provider_used = fb_provider
                         res.model_used = fb_model
@@ -205,7 +247,33 @@ class AgentEngine:
                         res.reply = res.reply.strip() + notice
                         return res
                     except Exception as fb_err:
-                        logger.error("Fallback provider %s failed: %s", fb_provider, fb_err)
+                        logger.error("Primary fallback provider %s failed: %s", fb_provider, fb_err)
+                        # Secondary fallback to OpenRouter if configured
+                        or_key = get_key("openrouter")
+                        if or_key and fb_provider != "openrouter" and active_provider != "openrouter":
+                            logger.info("Attempting secondary fallback to OpenRouter...")
+                            try:
+                                res = await self._run_openai_loop(
+                                    provider="openrouter",
+                                    model="openrouter/auto",
+                                    user_message=user_message,
+                                    history=compacted_history,
+                                    executions=executions,
+                                    conversation_id=conversation_id,
+                                    system_prompt=active_system_prompt,
+                                )
+                                res.provider_used = "openrouter"
+                                res.model_used = "openrouter/auto"
+                                res.fallback_occurred = True
+                                res.fallback_from = active_provider
+                                notice = (
+                                    f"\n\n*(⚡ Switched to **OpenRouter** (`openrouter/auto`) fallback: "
+                                    f"{active_provider.capitalize()} was rate-limited.)*"
+                                )
+                                res.reply = res.reply.strip() + notice
+                                return res
+                            except Exception as fb2_err:
+                                logger.error("Secondary fallback to OpenRouter failed: %s", fb2_err)
 
             # 3. Fallback disabled or fallback failed: craft clear, non-destructive user notification
             state_report = ""

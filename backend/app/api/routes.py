@@ -1,6 +1,7 @@
 from __future__ import annotations
 import json
 from fastapi import APIRouter, HTTPException, Query, Request, Depends
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from dotenv import set_key
 from app.core.config import BASE, settings
@@ -897,4 +898,451 @@ def trigger_emergency_stop_endpoint(b: EmergencyStopRequest | None = None):
 @r.post("/emergency/resume", dependencies=[Depends(verify_local_origin)])
 def clear_emergency_stop_endpoint():
     return clear_emergency_stop()
+
+
+# -------------------------------------------------------------
+# PHASE 6, QUEUE 1: WINDOWS DESKTOP CONTROL ENDPOINTS
+# -------------------------------------------------------------
+from app.desktop import (
+    desktop_engine,
+    get_active_window,
+    list_windows,
+    focus_window,
+    capture_screenshot,
+    list_screenshots,
+    get_screenshot_thumbnail,
+    inspect_ui,
+    mouse_click,
+    mouse_scroll,
+    keyboard_type,
+    keyboard_press,
+)
+from pathlib import Path
+
+
+class DesktopFocusRequest(BaseModel):
+    hwnd: int | None = None
+    title: str | None = None
+
+
+class DesktopScreenshotRequest(BaseModel):
+    target: str = "desktop"
+    hwnd: int | None = None
+
+
+class DesktopInspectRequest(BaseModel):
+    hwnd: int | None = None
+    max_depth: int = 3
+    max_elements: int = 40
+    filter_types: list[str] | None = None
+    interactive_only: bool = False
+
+
+class DesktopActionRequest(BaseModel):
+    action_type: str  # "click", "scroll", "type", "press"
+    params: dict = Field(default_factory=dict)
+
+
+@r.get("/desktop/status")
+def get_desktop_status_endpoint():
+    return desktop_engine.get_status()
+
+
+@r.get("/desktop/windows")
+def get_desktop_windows_endpoint(limit: int = 25, only_visible: bool = True):
+    return list_windows(limit=limit, only_visible=only_visible)
+
+
+@r.post("/desktop/windows/focus", dependencies=[Depends(verify_local_origin)])
+def focus_desktop_window_endpoint(b: DesktopFocusRequest):
+    res = focus_window(hwnd=b.hwnd, title=b.title)
+    desktop_engine.record_action("window.focus", b.dict(), res.get("success", False), res.get("error"))
+    if not res.get("success"):
+        raise HTTPException(400, res.get("error", "Failed to focus window."))
+    return res
+
+
+@r.post("/desktop/screenshot", dependencies=[Depends(verify_local_origin)])
+def capture_desktop_screenshot_endpoint(b: DesktopScreenshotRequest | None = None):
+    target = b.target if b else "desktop"
+    hwnd = b.hwnd if b else None
+    res = capture_screenshot(target=target, hwnd=hwnd)
+    desktop_engine.record_action("screen.capture", {"target": target, "hwnd": hwnd}, res.get("success", False), res.get("error"))
+    if not res.get("success"):
+        raise HTTPException(400, res.get("error", "Failed to capture screenshot."))
+    return res
+
+
+@r.get("/desktop/screenshots")
+def list_desktop_screenshots_endpoint(limit: int = 20):
+    return list_screenshots(limit=limit)
+
+
+@r.get("/desktop/screenshot/view")
+def view_desktop_screenshot_endpoint(path: str):
+    """Serve local screenshot securely, validating path is within Downloads/LAPTOP_AI/Screenshots."""
+    file_path = Path(path).resolve()
+    allowed_dir = (Path.home() / "Downloads" / "LAPTOP_AI" / "Screenshots").resolve()
+    if not str(file_path).startswith(str(allowed_dir)):
+        raise HTTPException(403, "Access denied: Image path outside authorized Screenshots folder.")
+    if not file_path.is_file():
+        raise HTTPException(404, "Screenshot file not found.")
+    return FileResponse(str(file_path), media_type="image/png")
+
+
+@r.post("/desktop/inspect", dependencies=[Depends(verify_local_origin)])
+def inspect_desktop_ui_endpoint(b: DesktopInspectRequest | None = None):
+    req = b or DesktopInspectRequest()
+    res = inspect_ui(
+        hwnd=req.hwnd,
+        max_depth=req.max_depth,
+        max_elements=req.max_elements,
+        filter_types=req.filter_types,
+        interactive_only=req.interactive_only,
+    )
+    desktop_engine.record_action("ui.inspect", req.dict(), res.get("success", False), res.get("error"))
+    return res
+
+
+@r.post("/desktop/action", dependencies=[Depends(verify_local_origin)])
+def execute_desktop_action_endpoint(b: DesktopActionRequest):
+    a_type = b.action_type.lower().strip()
+    params = b.params
+    res = {"success": False, "error": f"Unknown action type: {a_type}"}
+
+    if a_type == "click":
+        res = mouse_click(
+            element_query=params.get("element_query"),
+            control_type=params.get("control_type"),
+            x=params.get("x"),
+            y=params.get("y"),
+            button=params.get("button", "left"),
+            clicks=params.get("clicks", 1),
+        )
+    elif a_type == "scroll":
+        res = mouse_scroll(
+            clicks=params.get("clicks", 3),
+            direction=params.get("direction", "down"),
+            x=params.get("x"),
+            y=params.get("y"),
+        )
+    elif a_type == "type":
+        text = params.get("text", "")
+        press_enter = params.get("press_enter", False)
+        res = keyboard_type(text=text, press_enter=press_enter)
+    elif a_type == "press":
+        key = params.get("key")
+        keys = params.get("keys")
+        modifiers = params.get("modifiers")
+        res = keyboard_press(key=key, keys=keys, modifiers=modifiers)
+
+    desktop_engine.record_action(f"action.{a_type}", params, res.get("success", False), res.get("error"))
+    if not res.get("success"):
+        raise HTTPException(400, res.get("error", "Action failed."))
+    return res
+
+
+@r.get("/desktop/history")
+def get_desktop_history_endpoint(limit: int = 30):
+    return desktop_engine.get_action_history(limit=limit)
+
+
+# =====================================================================
+# VISUAL DESKTOP INTELLIGENCE ENDPOINTS (QUEUE 2)
+# =====================================================================
+
+class VisionAnalyzeReq(BaseModel):
+    target: str = "desktop"
+    prompt: Optional[str] = None
+    hwnd: Optional[int] = None
+    use_multimodal: bool = True
+
+
+class VisionOcrReq(BaseModel):
+    target: str = "desktop"
+    hwnd: Optional[int] = None
+
+
+class VisionFindReq(BaseModel):
+    query: str
+    target: str = "desktop"
+    hwnd: Optional[int] = None
+
+
+class VisionCompareReq(BaseModel):
+    image_path_1: str
+    image_path_2: str
+
+
+class VisionCleanupReq(BaseModel):
+    max_age_hours: int = 24
+    keep_latest: int = 20
+
+
+@r.post("/vision/analyze", dependencies=[Depends(verify_local_origin)])
+async def vision_analyze_endpoint(req: VisionAnalyzeReq):
+    from app.vision import vision_engine
+    try:
+        res = await vision_engine.analyze_screen(
+            target=req.target,
+            prompt=req.prompt,
+            hwnd=req.hwnd,
+            use_multimodal=req.use_multimodal,
+        )
+        return res.model_dump()
+    except Exception as e:
+        logger.error("Vision analyze endpoint failed: %s", e)
+        raise HTTPException(500, f"Vision analysis failed: {str(e)}")
+
+
+@r.post("/vision/ocr", dependencies=[Depends(verify_local_origin)])
+def vision_ocr_endpoint(req: VisionOcrReq):
+    from app.vision import vision_engine
+    try:
+        res = vision_engine.extract_text(target=req.target, hwnd=req.hwnd)
+        return res.model_dump()
+    except Exception as e:
+        logger.error("Vision OCR endpoint failed: %s", e)
+        raise HTTPException(500, f"Vision OCR failed: {str(e)}")
+
+
+@r.post("/vision/find", dependencies=[Depends(verify_local_origin)])
+def vision_find_endpoint(req: VisionFindReq):
+    from app.vision import vision_engine
+    try:
+        res = vision_engine.find_element(query=req.query, target=req.target, hwnd=req.hwnd)
+        return res.model_dump()
+    except Exception as e:
+        logger.error("Vision find endpoint failed: %s", e)
+        raise HTTPException(500, f"Visual grounding failed: {str(e)}")
+
+
+@r.post("/vision/compare", dependencies=[Depends(verify_local_origin)])
+def vision_compare_endpoint(req: VisionCompareReq):
+    from app.vision import vision_engine
+    try:
+        res = vision_engine.compare_screens(image_path_1=req.image_path_1, image_path_2=req.image_path_2)
+        return res.model_dump()
+    except Exception as e:
+        logger.error("Vision compare endpoint failed: %s", e)
+        raise HTTPException(500, f"Screen comparison failed: {str(e)}")
+
+
+@r.get("/vision/history")
+def vision_history_endpoint(limit: int = 20):
+    from app.vision import vision_engine
+    return vision_engine.get_history(limit=limit)
+
+
+@r.post("/vision/history/clear", dependencies=[Depends(verify_local_origin)])
+def vision_clear_history_endpoint():
+    from app.vision import vision_engine
+    vision_engine.clear_history()
+    return {"success": True, "message": "Visual analysis history cleared."}
+
+
+@r.post("/vision/cleanup", dependencies=[Depends(verify_local_origin)])
+def vision_cleanup_endpoint(req: VisionCleanupReq):
+    from app.vision import cleanup_old_screenshots
+    deleted = cleanup_old_screenshots(max_age_hours=req.max_age_hours, keep_latest=req.keep_latest)
+    return {"success": True, "deleted_count": deleted}
+
+
+# -------------------------------------------------------------
+# PHASE 6 QUEUE 3: ADVANCED FILE INTELLIGENCE ENDPOINTS
+# -------------------------------------------------------------
+
+class FileExtractReq(BaseModel):
+    path: str
+
+class FileSummarizeReq(BaseModel):
+    path: str
+    max_sentences: int = 5
+
+class FileAskReq(BaseModel):
+    path: str
+    question: str
+
+class FileCompareReq(BaseModel):
+    file_a: str
+    file_b: str
+
+class FileIndexRefreshReq(BaseModel):
+    path: str
+    recursive: bool = True
+    max_files: int = 100
+
+class FileSpreadsheetAnalyzeReq(BaseModel):
+    path: str
+    sheet_name: Optional[str] = None
+
+class FileSpreadsheetQueryReq(BaseModel):
+    path: str
+    filter_col: Optional[str] = None
+    filter_val: Optional[str] = None
+    sort_by: Optional[str] = None
+    descending: bool = False
+    sheet_name: Optional[str] = None
+    limit: int = 50
+
+class FileDuplicatesReq(BaseModel):
+    folder_path: str
+    max_files: int = 300
+
+class FileOrgPreviewReq(BaseModel):
+    folder_path: str
+
+class FileOrgExecuteReq(BaseModel):
+    action_items: List[Dict[str, Any]]
+    quarantine_root: Optional[str] = None
+
+class FileOrgRollbackReq(BaseModel):
+    rollback_token: str
+
+
+@r.post("/files/extract", dependencies=[Depends(verify_local_origin)])
+def files_extract_endpoint(req: FileExtractReq):
+    from app.files.engine import engine
+    try:
+        doc = engine.extract_document(req.path)
+        return doc.model_dump()
+    except Exception as e:
+        logger.error("File extraction failed: %s", e)
+        raise HTTPException(400, f"Document extraction failed: {str(e)}")
+
+
+@r.post("/files/summarize", dependencies=[Depends(verify_local_origin)])
+def files_summarize_endpoint(req: FileSummarizeReq):
+    from app.files.engine import engine
+    try:
+        return engine.summarize_document(req.path, max_sentences=req.max_sentences)
+    except Exception as e:
+        logger.error("File summarization failed: %s", e)
+        raise HTTPException(400, f"Document summarization failed: {str(e)}")
+
+
+@r.post("/files/ask", dependencies=[Depends(verify_local_origin)])
+def files_ask_endpoint(req: FileAskReq):
+    from app.files.engine import engine
+    try:
+        res = engine.ask_document(req.path, req.question)
+        return res.model_dump()
+    except Exception as e:
+        logger.error("File ask failed: %s", e)
+        raise HTTPException(400, f"Document Q&A failed: {str(e)}")
+
+
+@r.post("/files/compare", dependencies=[Depends(verify_local_origin)])
+def files_compare_endpoint(req: FileCompareReq):
+    from app.files.engine import engine
+    try:
+        res = engine.compare_documents(req.file_a, req.file_b)
+        return res.model_dump()
+    except Exception as e:
+        logger.error("File comparison failed: %s", e)
+        raise HTTPException(400, f"Document comparison failed: {str(e)}")
+
+
+@r.get("/files/search")
+def files_search_endpoint(query: str, limit: int = 10, format_filter: Optional[str] = None):
+    from app.files.engine import engine
+    try:
+        res = engine.search_index(query, limit=limit, format_filter=format_filter)
+        return res.model_dump()
+    except Exception as e:
+        logger.error("File search failed: %s", e)
+        raise HTTPException(400, f"Document search failed: {str(e)}")
+
+
+@r.get("/files/index/status")
+def files_index_status_endpoint():
+    from app.files.engine import engine
+    return engine.get_index_status().model_dump()
+
+
+@r.post("/files/index/refresh", dependencies=[Depends(verify_local_origin)])
+def files_index_refresh_endpoint(req: FileIndexRefreshReq):
+    from app.files.engine import engine
+    try:
+        return engine.refresh_index(req.path, recursive=req.recursive, max_files=req.max_files)
+    except Exception as e:
+        logger.error("File index refresh failed: %s", e)
+        raise HTTPException(400, f"Index refresh failed: {str(e)}")
+
+
+@r.post("/files/index/clear", dependencies=[Depends(verify_local_origin)])
+def files_index_clear_endpoint():
+    from app.files.engine import engine
+    return engine.clear_index()
+
+
+@r.post("/files/spreadsheet/analyze", dependencies=[Depends(verify_local_origin)])
+def files_spreadsheet_analyze_endpoint(req: FileSpreadsheetAnalyzeReq):
+    from app.files.engine import engine
+    try:
+        return engine.profile_spreadsheet(req.path, sheet_name=req.sheet_name).model_dump()
+    except Exception as e:
+        logger.error("Spreadsheet analysis failed: %s", e)
+        raise HTTPException(400, f"Spreadsheet analysis failed: {str(e)}")
+
+
+@r.post("/files/spreadsheet/query", dependencies=[Depends(verify_local_origin)])
+def files_spreadsheet_query_endpoint(req: FileSpreadsheetQueryReq):
+    from app.files.engine import engine
+    try:
+        return engine.query_spreadsheet(
+            req.path,
+            filter_col=req.filter_col,
+            filter_val=req.filter_val,
+            sort_by=req.sort_by,
+            descending=req.descending,
+            sheet_name=req.sheet_name,
+            limit=req.limit,
+        )
+    except Exception as e:
+        logger.error("Spreadsheet query failed: %s", e)
+        raise HTTPException(400, f"Spreadsheet query failed: {str(e)}")
+
+
+@r.post("/files/duplicates", dependencies=[Depends(verify_local_origin)])
+def files_duplicates_endpoint(req: FileDuplicatesReq):
+    from app.files.engine import engine
+    try:
+        return engine.find_duplicates(req.folder_path, max_files=req.max_files)
+    except Exception as e:
+        logger.error("Duplicate search failed: %s", e)
+        raise HTTPException(400, f"Duplicate search failed: {str(e)}")
+
+
+@r.post("/files/organize/preview", dependencies=[Depends(verify_local_origin)])
+def files_organize_preview_endpoint(req: FileOrgPreviewReq):
+    from app.files.engine import engine
+    try:
+        return engine.preview_organization(req.folder_path)
+    except Exception as e:
+        logger.error("File organization preview failed: %s", e)
+        raise HTTPException(400, f"Organization preview failed: {str(e)}")
+
+
+@r.post("/files/organize/execute", dependencies=[Depends(verify_local_origin)])
+def files_organize_execute_endpoint(req: FileOrgExecuteReq):
+    from app.files.engine import engine
+    try:
+        return engine.execute_organization(req.action_items, quarantine_root=req.quarantine_root)
+    except Exception as e:
+        logger.error("File organization execution failed: %s", e)
+        raise HTTPException(400, f"Organization execution failed: {str(e)}")
+
+
+@r.post("/files/organize/rollback", dependencies=[Depends(verify_local_origin)])
+def files_organize_rollback_endpoint(req: FileOrgRollbackReq):
+    from app.files.engine import engine
+    try:
+        return engine.rollback_organization(req.rollback_token)
+    except Exception as e:
+        logger.error("File organization rollback failed: %s", e)
+        raise HTTPException(400, f"Organization rollback failed: {str(e)}")
+
+
+
 

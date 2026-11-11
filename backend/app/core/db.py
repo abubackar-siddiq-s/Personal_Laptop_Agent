@@ -244,6 +244,90 @@ def init_db():
         INSERT OR IGNORE INTO system_state(key, value) VALUES('emergency_stop', '0');
         """)
 
+        # Phase 6 Queue 3: Advanced File Intelligence Index
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS file_documents(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            path TEXT UNIQUE NOT NULL,
+            filename TEXT NOT NULL,
+            extension TEXT NOT NULL,
+            format TEXT NOT NULL,
+            size_bytes INTEGER NOT NULL,
+            mtime REAL NOT NULL,
+            sha256 TEXT NOT NULL,
+            title TEXT,
+            author TEXT,
+            page_count INTEGER DEFAULT 0,
+            metadata_json TEXT,
+            indexed_at TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+        """)
+        c.execute("CREATE INDEX IF NOT EXISTS idx_file_docs_path ON file_documents(path);")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_file_docs_sha ON file_documents(sha256);")
+
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS file_chunks(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            document_id INTEGER NOT NULL,
+            chunk_index INTEGER NOT NULL,
+            section_title TEXT,
+            page_number INTEGER,
+            sheet_name TEXT,
+            slide_number INTEGER,
+            content TEXT NOT NULL,
+            token_estimate INTEGER DEFAULT 0,
+            FOREIGN KEY(document_id) REFERENCES file_documents(id) ON DELETE CASCADE
+        );
+        """)
+        c.execute("CREATE INDEX IF NOT EXISTS idx_file_chunks_doc ON file_chunks(document_id, chunk_index);")
+
+        # FTS5 virtual table for document chunk search
+        c.execute("""
+        CREATE VIRTUAL TABLE IF NOT EXISTS file_chunks_fts USING fts5(
+            content,
+            section_title,
+            content='file_chunks',
+            content_rowid='id'
+        );
+        """)
+
+        # FTS5 sync triggers
+        c.execute("""
+        CREATE TRIGGER IF NOT EXISTS file_chunks_ai AFTER INSERT ON file_chunks BEGIN
+            INSERT INTO file_chunks_fts(rowid, content, section_title)
+            VALUES (new.id, new.content, new.section_title);
+        END;
+        """)
+        c.execute("""
+        CREATE TRIGGER IF NOT EXISTS file_chunks_ad AFTER DELETE ON file_chunks BEGIN
+            INSERT INTO file_chunks_fts(file_chunks_fts, rowid, content, section_title)
+            VALUES('delete', old.id, old.content, old.section_title);
+        END;
+        """)
+        c.execute("""
+        CREATE TRIGGER IF NOT EXISTS file_chunks_au AFTER UPDATE ON file_chunks BEGIN
+            INSERT INTO file_chunks_fts(file_chunks_fts, rowid, content, section_title)
+            VALUES('delete', old.id, old.content, old.section_title);
+            INSERT INTO file_chunks_fts(rowid, content, section_title)
+            VALUES (new.id, new.content, new.section_title);
+        END;
+        """)
+
+        # File Organize History for rollback and auditing
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS file_organize_history(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            action TEXT NOT NULL,
+            source_path TEXT NOT NULL,
+            target_path TEXT,
+            backup_path TEXT,
+            status TEXT DEFAULT 'completed',
+            details_json TEXT,
+            executed_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            rolled_back_at TEXT
+        );
+        """)
+
         # Migration: Ensure all columns exist
         cursor = c.execute("PRAGMA table_info(approvals)")
         existing_cols = {row["name"] for row in cursor.fetchall()}
