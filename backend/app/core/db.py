@@ -14,6 +14,10 @@ def conn() -> sqlite3.Connection:
     return c
 
 
+# Alias for compatibility with modular subsystems
+get_db = conn
+
+
 def init_db():
     with conn() as c:
         c.execute("""
@@ -327,6 +331,85 @@ def init_db():
             rolled_back_at TEXT
         );
         """)
+
+        # Phase 6 Queue 4: Proactive Personal Assistance
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS assistant_profile(
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            category TEXT NOT NULL,
+            is_confirmed INTEGER DEFAULT 1,
+            confidence REAL DEFAULT 1.0,
+            source TEXT DEFAULT 'user_explicit',
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+        """)
+        c.execute("CREATE INDEX IF NOT EXISTS idx_profile_cat ON assistant_profile(category);")
+
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS assistant_reminders(
+            id TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            description TEXT,
+            reminder_type TEXT DEFAULT 'one_time',
+            due_at TEXT NOT NULL,
+            interval_seconds INTEGER,
+            recurrence_rule TEXT,
+            status TEXT DEFAULT 'pending',
+            snoozed_until TEXT,
+            last_triggered_at TEXT,
+            metadata_json TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+        """)
+        c.execute("CREATE INDEX IF NOT EXISTS idx_reminders_status_due ON assistant_reminders(status, due_at);")
+
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS assistant_monitors(
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            monitor_type TEXT NOT NULL,
+            target_identifier TEXT,
+            threshold_seconds INTEGER DEFAULT 3600,
+            enabled INTEGER DEFAULT 1,
+            last_checked_at TEXT,
+            last_alert_at TEXT,
+            last_state_json TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+        """)
+        c.execute("CREATE INDEX IF NOT EXISTS idx_monitors_enabled ON assistant_monitors(enabled);")
+
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS notifications(
+            id TEXT PRIMARY KEY,
+            type TEXT NOT NULL,
+            title TEXT NOT NULL,
+            message TEXT NOT NULL,
+            severity TEXT DEFAULT 'info',
+            source_id TEXT,
+            read_status INTEGER DEFAULT 0,
+            dismissed INTEGER DEFAULT 0,
+            metadata_json TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+        """)
+        c.execute("CREATE INDEX IF NOT EXISTS idx_notifications_read ON notifications(read_status, dismissed, created_at);")
+
+        # Migration: Ensure tasks table has proactive assistance columns
+        task_cursor = c.execute("PRAGMA table_info(tasks)")
+        existing_task_cols = {row["name"] for row in task_cursor.fetchall()}
+        new_task_cols = {
+            "priority": "TEXT DEFAULT 'medium'",
+            "priority_reason": "TEXT",
+            "deadline": "TEXT",
+            "estimated_duration_minutes": "INTEGER DEFAULT 30",
+            "project_name": "TEXT",
+        }
+        for col, col_type in new_task_cols.items():
+            if col not in existing_task_cols:
+                c.execute(f"ALTER TABLE tasks ADD COLUMN {col} {col_type};")
 
         # Migration: Ensure all columns exist
         cursor = c.execute("PRAGMA table_info(approvals)")

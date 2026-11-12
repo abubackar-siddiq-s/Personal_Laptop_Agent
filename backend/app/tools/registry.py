@@ -61,6 +61,20 @@ class Registry:
         self.items = {k: v for k, v in self.items.items() if not k.startswith(p)}
         self._sync_name_map()
 
+    def list_all(self) -> list[Spec]:
+        return list(self.items.values())
+
+    def invoke(self, name: str, args: dict = None) -> any:
+        """Direct invocation helper."""
+        s = self.items.get(name)
+        if not s:
+            raise KeyError(f"Tool not found: {name}")
+        args = args or {}
+        res = s.handler(**args)
+        if asyncio.iscoroutine(res):
+            return asyncio.run(res)
+        return res
+
     def list(self) -> list[dict]:
         return [
             {

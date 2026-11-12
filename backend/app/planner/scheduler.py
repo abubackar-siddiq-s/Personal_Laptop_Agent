@@ -50,6 +50,13 @@ class TaskScheduler:
         if is_emergency_stopped():
             return {"executed": 0, "skipped_due_to_emergency_stop": True}
 
+        # Proactive Personal Assistance: Evaluate reminders and monitors on the same tick
+        try:
+            from app.assistant import assistant_engine
+            assistant_engine.tick()
+        except Exception as e:
+            logger.error("Error in assistant_engine tick: %s", e)
+
         now_iso = datetime.datetime.now().astimezone().isoformat()
         with conn() as c:
             rows = c.execute(
@@ -57,7 +64,7 @@ class TaskScheduler:
                 SELECT * FROM scheduled_tasks
                 WHERE enabled = 1 AND next_run_at <= ?
                 ORDER BY next_run_at ASC
-                LIMIT 5
+                LIMIT 50
                 """,
                 (now_iso,),
             ).fetchall()

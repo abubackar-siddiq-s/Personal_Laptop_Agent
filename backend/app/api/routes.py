@@ -1344,5 +1344,279 @@ def files_organize_rollback_endpoint(req: FileOrgRollbackReq):
         raise HTTPException(400, f"Organization rollback failed: {str(e)}")
 
 
+# ---------------------------------------------------------
+# Phase 6 Queue 4: Proactive Personal Assistance Endpoints
+# ---------------------------------------------------------
+
+class ContextQueryReq(BaseModel):
+    query: str
+
+
+class TaskPrioritizeReq(BaseModel):
+    priority: str
+    reason: str
+
+
+class MonitorToggleReq(BaseModel):
+    enabled: Optional[bool] = None
+
+
+@r.get("/assistant/profile")
+def assistant_profile_get():
+    from app.assistant import assistant_engine
+    try:
+        return assistant_engine.profile_mgr.get_full_profile().model_dump()
+    except Exception as e:
+        logger.error("Failed to fetch profile: %s", e)
+        raise HTTPException(500, str(e))
+
+
+@r.post("/assistant/profile")
+def assistant_profile_update(req: dict):
+    from app.assistant import assistant_engine, ProfileItem
+    from app.assistant.schemas import ProfileUpdateReq
+    try:
+        update_req = ProfileUpdateReq(
+            key=req.get("key", ""),
+            value=req.get("value"),
+            category=req.get("category", "preferences"),
+            is_confirmed=req.get("is_confirmed", True),
+            confidence=float(req.get("confidence", 1.0)),
+            source=req.get("source", "user_explicit"),
+        )
+        return assistant_engine.profile_mgr.update_profile_item(update_req).model_dump()
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except Exception as e:
+        logger.error("Failed to update profile: %s", e)
+        raise HTTPException(500, str(e))
+
+
+@r.get("/assistant/briefing")
+def assistant_briefing_get():
+    from app.assistant import assistant_engine
+    try:
+        return assistant_engine.briefing_gen.generate_briefing().model_dump()
+    except Exception as e:
+        logger.error("Failed to generate briefing: %s", e)
+        raise HTTPException(500, str(e))
+
+
+@r.get("/assistant/briefing/markdown")
+def assistant_briefing_markdown():
+    from app.assistant import assistant_engine
+    try:
+        return {"markdown": assistant_engine.briefing_gen.to_markdown()}
+    except Exception as e:
+        logger.error("Failed to generate markdown briefing: %s", e)
+        raise HTTPException(500, str(e))
+
+
+@r.get("/assistant/reminders")
+def assistant_reminders_list(status: Optional[str] = None, limit: int = 50):
+    from app.assistant import assistant_engine
+    try:
+        return [r.model_dump() for r in assistant_engine.reminder_mgr.list_reminders(status=status, limit=limit)]
+    except Exception as e:
+        logger.error("Failed to list reminders: %s", e)
+        raise HTTPException(500, str(e))
+
+
+@r.post("/assistant/reminders")
+def assistant_reminders_create(req: dict):
+    from app.assistant import assistant_engine
+    from app.assistant.schemas import ReminderCreate
+    try:
+        create_req = ReminderCreate(**req)
+        return assistant_engine.reminder_mgr.create_reminder(create_req).model_dump()
+    except Exception as e:
+        logger.error("Failed to create reminder: %s", e)
+        raise HTTPException(400, str(e))
+
+
+@r.post("/assistant/reminders/{reminder_id}/snooze")
+def assistant_reminders_snooze(reminder_id: str, req: dict = None):
+    from app.assistant import assistant_engine
+    try:
+        req = req or {}
+        snooze_minutes = int(req.get("snooze_minutes", 15))
+        snooze_until = req.get("snooze_until")
+        item = assistant_engine.reminder_mgr.snooze_reminder(reminder_id, snooze_minutes=snooze_minutes, snooze_until=snooze_until)
+        if not item:
+            raise HTTPException(404, "Reminder not found")
+        return item.model_dump()
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Failed to snooze reminder: %s", e)
+        raise HTTPException(500, str(e))
+
+
+@r.post("/assistant/reminders/{reminder_id}/dismiss")
+def assistant_reminders_dismiss(reminder_id: str):
+    from app.assistant import assistant_engine
+    try:
+        success = assistant_engine.reminder_mgr.dismiss_reminder(reminder_id)
+        if not success:
+            raise HTTPException(404, "Reminder not found")
+        return {"status": "dismissed", "reminder_id": reminder_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Failed to dismiss reminder: %s", e)
+        raise HTTPException(500, str(e))
+
+
+@r.get("/assistant/monitors")
+def assistant_monitors_list(enabled_only: bool = False):
+    from app.assistant import assistant_engine
+    try:
+        return [m.model_dump() for m in assistant_engine.monitor_mgr.list_monitors(enabled_only=enabled_only)]
+    except Exception as e:
+        logger.error("Failed to list monitors: %s", e)
+        raise HTTPException(500, str(e))
+
+
+@r.post("/assistant/monitors")
+def assistant_monitors_create(req: dict):
+    from app.assistant import assistant_engine
+    from app.assistant.schemas import MonitorCreate
+    try:
+        create_req = MonitorCreate(**req)
+        return assistant_engine.monitor_mgr.create_monitor(create_req).model_dump()
+    except Exception as e:
+        logger.error("Failed to create monitor: %s", e)
+        raise HTTPException(400, str(e))
+
+
+@r.post("/assistant/monitors/{monitor_id}/toggle")
+def assistant_monitors_toggle(monitor_id: str, req: MonitorToggleReq = None):
+    from app.assistant import assistant_engine
+    try:
+        enabled = req.enabled if req else None
+        item = assistant_engine.monitor_mgr.toggle_monitor(monitor_id, enabled=enabled)
+        if not item:
+            raise HTTPException(404, "Monitor not found")
+        return item.model_dump()
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Failed to toggle monitor: %s", e)
+        raise HTTPException(500, str(e))
+
+
+@r.delete("/assistant/monitors/{monitor_id}")
+def assistant_monitors_delete(monitor_id: str):
+    from app.assistant import assistant_engine
+    try:
+        deleted = assistant_engine.monitor_mgr.delete_monitor(monitor_id)
+        if not deleted:
+            raise HTTPException(404, "Monitor not found")
+        return {"status": "deleted", "monitor_id": monitor_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Failed to delete monitor: %s", e)
+        raise HTTPException(500, str(e))
+
+
+@r.get("/assistant/notifications")
+def assistant_notifications_list(unread_only: bool = False, limit: int = 50):
+    from app.assistant import assistant_engine
+    try:
+        return [n.model_dump() for n in assistant_engine.notification_mgr.list_notifications(unread_only=unread_only, limit=limit)]
+    except Exception as e:
+        logger.error("Failed to list notifications: %s", e)
+        raise HTTPException(500, str(e))
+
+
+@r.post("/assistant/notifications/{notification_id}/read")
+def assistant_notifications_mark_read(notification_id: str):
+    from app.assistant import assistant_engine
+    try:
+        success = assistant_engine.notification_mgr.mark_read(notification_id)
+        if not success:
+            raise HTTPException(404, "Notification not found")
+        return {"status": "read", "notification_id": notification_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Failed to mark notification read: %s", e)
+        raise HTTPException(500, str(e))
+
+
+@r.post("/assistant/notifications/{notification_id}/dismiss")
+def assistant_notifications_dismiss(notification_id: str):
+    from app.assistant import assistant_engine
+    try:
+        success = assistant_engine.notification_mgr.dismiss_notification(notification_id)
+        if not success:
+            raise HTTPException(404, "Notification not found")
+        return {"status": "dismissed", "notification_id": notification_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Failed to dismiss notification: %s", e)
+        raise HTTPException(500, str(e))
+
+
+@r.post("/assistant/tasks/natural")
+def assistant_tasks_create_natural(req: dict):
+    from app.assistant import assistant_engine
+    from app.assistant.schemas import TaskNaturalCreate
+    try:
+        create_req = TaskNaturalCreate(**req)
+        return assistant_engine.task_intel.create_natural_task(create_req)
+    except Exception as e:
+        logger.error("Failed to create natural task: %s", e)
+        raise HTTPException(400, str(e))
+
+
+@r.post("/assistant/tasks/{task_id}/prioritize")
+def assistant_tasks_prioritize(task_id: str, req: TaskPrioritizeReq):
+    from app.assistant import assistant_engine
+    try:
+        result = assistant_engine.task_intel.prioritize_task(task_id, req.priority, req.reason)
+        if not result:
+            raise HTTPException(404, "Task not found")
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Failed to prioritize task: %s", e)
+        raise HTTPException(500, str(e))
+
+
+@r.get("/assistant/plan/daily")
+def assistant_plan_daily():
+    from app.assistant import assistant_engine
+    try:
+        return assistant_engine.task_intel.generate_daily_plan()
+    except Exception as e:
+        logger.error("Failed to generate daily plan: %s", e)
+        raise HTTPException(500, str(e))
+
+
+@r.get("/assistant/plan/weekly")
+def assistant_plan_weekly():
+    from app.assistant import assistant_engine
+    try:
+        return assistant_engine.task_intel.generate_weekly_plan()
+    except Exception as e:
+        logger.error("Failed to generate weekly plan: %s", e)
+        raise HTTPException(500, str(e))
+
+
+@r.post("/assistant/context-query")
+def assistant_context_query(req: ContextQueryReq):
+    from app.assistant import assistant_engine
+    try:
+        return assistant_engine.answer_context_query(req.query)
+    except Exception as e:
+        logger.error("Failed to answer context query: %s", e)
+        raise HTTPException(500, str(e))
+
+
+
 
 

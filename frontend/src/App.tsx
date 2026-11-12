@@ -3,7 +3,7 @@ import {
   Activity,Bot,Boxes,ChevronRight,CircleHelp,Command,Cpu,Folder,Globe,LayoutDashboard,
   MessageSquare,Plus,Search,Send,Settings,ShieldCheck,Sparkles,Terminal,Workflow,Plug,
   RefreshCw,Check,X,Server,PanelLeftClose,Zap,Clock3,ArrowUpRight,ArrowLeft,ArrowRight,
-  RotateCw,Camera,Download,ExternalLink,Trash2,Shield,Eye,
+  RotateCw,Camera,Download,ExternalLink,Trash2,Shield,Eye,Bell,User,
   AlertTriangle,Play,Pause,Calendar,Brain,Edit2,Archive,Repeat,StopCircle,
   Monitor,MousePointer,Keyboard,FileText,Table,Filter,Copy,FileCheck,Files
 } from 'lucide-react';
@@ -14,9 +14,11 @@ type Msg = {role:string;content:string};
 
 const nav = [
   ['Overview',LayoutDashboard],
+  ['Assistant',Sparkles],
   ['Chat',MessageSquare],
   ['Desktop',Monitor],
   ['Visual AI',Eye],
+  ['Files',Folder],
   ['Tasks',Workflow],
   ['Memory',Brain],
   ['Browser',Globe],
@@ -25,7 +27,6 @@ const nav = [
   ['Activity Log',Clock3],
   ['Settings',Settings],
   ['System',Activity],
-  ['Files',Folder],
   ['Terminal',Terminal]
 ];
 
@@ -161,6 +162,31 @@ export default function App() {
   const [fIdxStatus, setFIdxStatus] = useState<any>(null);
   const [fIdxFolder, setFIdxFolder] = useState('Downloads');
   const [fIdxLoading, setFIdxLoading] = useState(false);
+
+  // Proactive Personal Assistance State (Queue 4)
+  const [asTab, setAsTab] = useState<'briefing' | 'reminders' | 'monitors' | 'profile' | 'notifications' | 'plan'>('briefing');
+  const [asBriefing, setAsBriefing] = useState<any>(null);
+  const [asBriefingLoading, setAsBriefingLoading] = useState(false);
+  const [asReminders, setAsReminders] = useState<any[]>([]);
+  const [asMonitors, setAsMonitors] = useState<any[]>([]);
+  const [asNotifications, setAsNotifications] = useState<any[]>([]);
+  const [asProfile, setAsProfile] = useState<any>(null);
+  const [asDailyPlan, setAsDailyPlan] = useState<any>(null);
+  const [asUnreadCount, setAsUnreadCount] = useState<number>(0);
+
+  // Assistant forms
+  const [remTitle, setRemTitle] = useState('');
+  const [remDueAt, setRemDueAt] = useState('');
+  const [remType, setRemType] = useState('one_time');
+  const [monName, setMonName] = useState('');
+  const [monType, setMonType] = useState('task_overdue');
+  const [monTarget, setMonTarget] = useState('*');
+  const [monThreshold, setMonThreshold] = useState(3600);
+  const [natTaskInput, setNatTaskInput] = useState('');
+  const [natTaskPriority, setNatTaskPriority] = useState('');
+  const [newPrefKey, setNewPrefKey] = useState('');
+  const [newPrefVal, setNewPrefVal] = useState('');
+  const [newPrefCat, setNewPrefCat] = useState('preferences');
 
   async function req(path:string,init?:RequestInit) {
     let r = await fetch(API+path,{headers:{'Content-Type':'application/json'},...init});
@@ -896,10 +922,201 @@ export default function App() {
     }
   }
 
+  // Assistant Action Handlers (Queue 4)
+  async function loadAssistantData() {
+    try {
+      setAsBriefingLoading(true);
+      let [b, r, m, n, p, pl] = await Promise.all([
+        req('/assistant/briefing').catch(() => null),
+        req('/assistant/reminders').catch(() => []),
+        req('/assistant/monitors').catch(() => []),
+        req('/assistant/notifications').catch(() => []),
+        req('/assistant/profile').catch(() => null),
+        req('/assistant/plan/daily').catch(() => null),
+      ]);
+      setAsBriefing(b);
+      setAsReminders(r || []);
+      setAsMonitors(m || []);
+      setAsNotifications(n || []);
+      setAsProfile(p);
+      setAsDailyPlan(pl);
+      if (Array.isArray(n)) {
+        setAsUnreadCount(n.filter((item: any) => !item.read_status && !item.dismissed).length);
+      }
+    } catch (e: any) {
+      console.error('Failed to load assistant data:', e);
+    } finally {
+      setAsBriefingLoading(false);
+    }
+  }
+
+  async function snoozeReminder(id: string, mins: number) {
+    try {
+      await req(`/assistant/reminders/${id}/snooze`, {
+        method: 'POST',
+        body: JSON.stringify({ snooze_minutes: mins }),
+      });
+      Z(`Reminder snoozed for ${mins} minutes.`);
+      loadAssistantData();
+    } catch (e: any) {
+      Z(`Snooze failed: ${e.message}`);
+    }
+  }
+
+  async function dismissReminder(id: string) {
+    try {
+      await req(`/assistant/reminders/${id}/dismiss`, { method: 'POST' });
+      Z('Reminder dismissed.');
+      loadAssistantData();
+    } catch (e: any) {
+      Z(`Dismiss failed: ${e.message}`);
+    }
+  }
+
+  async function createReminderAction() {
+    if (!remTitle.trim() || !remDueAt.trim()) {
+      Z('Title and due time are required.');
+      return;
+    }
+    try {
+      await req('/assistant/reminders', {
+        method: 'POST',
+        body: JSON.stringify({
+          title: remTitle.trim(),
+          due_at: remDueAt,
+          reminder_type: remType,
+        }),
+      });
+      setRemTitle('');
+      setRemDueAt('');
+      Z('Reminder created successfully.');
+      loadAssistantData();
+    } catch (e: any) {
+      Z(`Failed to create reminder: ${e.message}`);
+    }
+  }
+
+  async function toggleMonitor(id: string, enabled: boolean) {
+    try {
+      await req(`/assistant/monitors/${id}/toggle`, {
+        method: 'POST',
+        body: JSON.stringify({ enabled }),
+      });
+      Z(`Monitor ${enabled ? 'enabled' : 'paused'}.`);
+      loadAssistantData();
+    } catch (e: any) {
+      Z(`Toggle failed: ${e.message}`);
+    }
+  }
+
+  async function deleteMonitor(id: string) {
+    try {
+      await req(`/assistant/monitors/${id}`, { method: 'DELETE' });
+      Z('Monitor deleted.');
+      loadAssistantData();
+    } catch (e: any) {
+      Z(`Delete failed: ${e.message}`);
+    }
+  }
+
+  async function createMonitorAction() {
+    if (!monName.trim()) {
+      Z('Monitor name required.');
+      return;
+    }
+    try {
+      await req('/assistant/monitors', {
+        method: 'POST',
+        body: JSON.stringify({
+          name: monName.trim(),
+          monitor_type: monType,
+          target_identifier: monTarget.trim() || '*',
+          threshold_seconds: Number(monThreshold) || 3600,
+        }),
+      });
+      setMonName('');
+      Z('Monitor created successfully.');
+      loadAssistantData();
+    } catch (e: any) {
+      Z(`Failed to create monitor: ${e.message}`);
+    }
+  }
+
+  async function dismissNotification(id: string) {
+    try {
+      await req(`/assistant/notifications/${id}/dismiss`, { method: 'POST' });
+      loadAssistantData();
+    } catch (e: any) {
+      Z(`Dismiss notification failed: ${e.message}`);
+    }
+  }
+
+  async function confirmProfileItem(key: string, val: any, cat: string) {
+    try {
+      await req('/assistant/profile', {
+        method: 'POST',
+        body: JSON.stringify({
+          key,
+          value: val,
+          category: cat,
+          is_confirmed: true,
+          confidence: 1.0,
+          source: 'user_confirmed',
+        }),
+      });
+      Z(`Confirmed preference: ${key}`);
+      loadAssistantData();
+    } catch (e: any) {
+      Z(`Failed to confirm preference: ${e.message}`);
+    }
+  }
+
+  async function createProfileItem() {
+    if (!newPrefKey.trim()) return;
+    try {
+      await req('/assistant/profile', {
+        method: 'POST',
+        body: JSON.stringify({
+          key: newPrefKey.trim(),
+          value: newPrefVal.trim(),
+          category: newPrefCat,
+          is_confirmed: true,
+        }),
+      });
+      setNewPrefKey('');
+      setNewPrefVal('');
+      Z('Preference saved.');
+      loadAssistantData();
+    } catch (e: any) {
+      Z(`Save failed: ${e.message}`);
+    }
+  }
+
+  async function createNaturalTaskAction() {
+    if (!natTaskInput.trim()) return;
+    try {
+      let payload: any = { user_request: natTaskInput.trim() };
+      if (natTaskPriority) payload.priority = natTaskPriority;
+      let res = await req('/assistant/tasks/natural', {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      });
+      setNatTaskInput('');
+      setNatTaskPriority('');
+      Z(`Task created: "${res.title}" [${res.priority}]`);
+      loadAssistantData();
+    } catch (e: any) {
+      Z(`Task creation failed: ${e.message}`);
+    }
+  }
+
   useEffect(() => {
     refresh();
     if (page === 'Files') {
       loadIndexStatusAction();
+    }
+    if (page === 'Assistant') {
+      loadAssistantData();
     }
     let i = setInterval(refresh, 10000);
     return () => clearInterval(i);
@@ -1169,21 +1386,22 @@ export default function App() {
           <Search size={14}/><span>Search navigation</span><kbd>⌘ K</kbd>
         </div>
         <div className="navlabel">WORKSPACE</div>
-        {nav.slice(0,2).map(([n,I]:any)=>(
+        {nav.slice(0,3).map(([n,I]:any)=>(
           <button key={n} className={'nav '+(page===n?'selected':'')} onClick={()=>P(n)}>
             <I size={17}/>{n}
+            {n==='Assistant'&&asUnreadCount>0&&<small className="notif-badge">{asUnreadCount}</small>}
           </button>
         ))}
         <div className="navlabel">CONTROL CENTER</div>
-        {nav.slice(2,5).map(([n,I]:any)=>(
+        {nav.slice(3,7).map(([n,I]:any)=>(
           <button key={n} className={'nav '+(page===n?'selected':'')} onClick={()=>P(n)}>
-            <I size={17}/>{n}{n==='Tool Registry'&&<small className="count">{tools.length}</small>}
+            <I size={17}/>{n}
           </button>
         ))}
         <div className="navlabel">PREFERENCES & TOOLS</div>
-        {nav.slice(5).map(([n,I]:any)=>(
+        {nav.slice(7).map(([n,I]:any)=>(
           <button key={n} className={'nav '+(page===n?'selected':'')} onClick={()=>P(n)}>
-            <I size={17}/>{n}
+            <I size={17}/>{n}{n==='Tool Registry'&&<small className="count">{tools.length}</small>}
           </button>
         ))}
         <div className="sidebottom">
@@ -1213,6 +1431,10 @@ export default function App() {
               </button>
             )}
             <span className="online"><i/> Local engine</span>
+            <button className="ghost" onClick={() => { P('Assistant'); setAsTab('notifications'); }} title="Notifications">
+              <Bell size={16}/>
+              {asUnreadCount > 0 && <span className="notif-badge">{asUnreadCount}</span>}
+            </button>
             <button className="ghost" onClick={refresh}><RefreshCw size={16}/></button>
             <CircleHelp size={17}/>
           </div>
@@ -3265,7 +3487,449 @@ export default function App() {
             )}
           </>}
 
-          {!['Overview','Chat','Tool Registry','Models','Settings','Activity Log','Browser','Tasks','Memory','Desktop','Visual AI','Files'].includes(page)&&(
+          {page === 'Assistant' && <>
+            <Heading
+              tag="PHASE 6 QUEUE 4"
+              title="Proactive Personal Assistance"
+              desc="Autonomous daily briefings, intelligent deadline reminders, continuous system monitoring, and personalized task synthesis."
+              action={
+                <div style={{display:'flex',gap:'8px'}}>
+                  <button className="primary" onClick={loadAssistantData} disabled={asBriefingLoading}>
+                    <RefreshCw size={14}/> {asBriefingLoading ? 'Refreshing...' : 'Refresh Assistant'}
+                  </button>
+                </div>
+              }
+            />
+
+            {/* Sub-tab navigation */}
+            <div className="vision-tab-bar" style={{marginBottom:'16px'}}>
+              <button className={`vision-tab-btn ${asTab === 'briefing' ? 'active' : ''}`} onClick={() => setAsTab('briefing')}>
+                <Sparkles size={13}/> Daily Briefing
+              </button>
+              <button className={`vision-tab-btn ${asTab === 'reminders' ? 'active' : ''}`} onClick={() => setAsTab('reminders')}>
+                <Calendar size={13}/> Reminders ({asReminders.filter(r => r.status === 'pending' || r.status === 'snoozed').length})
+              </button>
+              <button className={`vision-tab-btn ${asTab === 'monitors' ? 'active' : ''}`} onClick={() => setAsTab('monitors')}>
+                <Shield size={13}/> Monitors ({asMonitors.filter(m => m.enabled).length})
+              </button>
+              <button className={`vision-tab-btn ${asTab === 'plan' ? 'active' : ''}`} onClick={() => setAsTab('plan')}>
+                <Workflow size={13}/> Daily Plan
+              </button>
+              <button className={`vision-tab-btn ${asTab === 'profile' ? 'active' : ''}`} onClick={() => setAsTab('profile')}>
+                <User size={13}/> Profile & Preferences
+              </button>
+              <button className={`vision-tab-btn ${asTab === 'notifications' ? 'active' : ''}`} onClick={() => setAsTab('notifications')}>
+                <Bell size={13}/> Notifications {asUnreadCount > 0 && <span className="notif-badge">{asUnreadCount}</span>}
+              </button>
+            </div>
+
+            {/* TAB 1: BRIEFING */}
+            {asTab === 'briefing' && (
+              <div className="as-layout">
+                {asBriefing && (
+                  <div className="as-briefing-hero">
+                    <div className="as-greeting">{asBriefing.greeting}</div>
+                    <div className="as-summary">{asBriefing.summary}</div>
+                    
+                    <div style={{marginTop:'16px',fontWeight:700,fontSize:'12px',color:'#f1f5f9'}}>
+                      Actionable Next Steps
+                    </div>
+                    <div className="as-steps-grid">
+                      {asBriefing.actionable_next_steps?.map((st: string, idx: number) => (
+                        <div key={idx} className="as-step-card">
+                          <ChevronRight size={14} color="#60a5fa" style={{flexShrink:0,marginTop:'2px'}}/>
+                          <div>{st}</div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {/* Quick Natural Task Creation */}
+                <div className="box" style={{padding:'16px'}}>
+                  <h4><Plus size={14}/> Natural Language Task Quick-Add</h4>
+                  <div style={{display:'flex',gap:'8px',marginTop:'10px'}}>
+                    <input
+                      style={{flex:1}}
+                      placeholder="e.g. 'Review quarterly budget and finish by 5pm tomorrow #finance' or 'Fix auth bug asap'"
+                      value={natTaskInput}
+                      onChange={e => setNatTaskInput(e.target.value)}
+                      onKeyDown={e => { if (e.key === 'Enter') createNaturalTaskAction(); }}
+                    />
+                    <select value={natTaskPriority} onChange={e => setNatTaskPriority(e.target.value)} style={{width:'130px'}}>
+                      <option value="">Auto-Priority</option>
+                      <option value="critical">Critical</option>
+                      <option value="high">High</option>
+                      <option value="medium">Medium</option>
+                      <option value="low">Low</option>
+                    </select>
+                    <button className="primary" onClick={createNaturalTaskAction}>Add Task</button>
+                  </div>
+                </div>
+
+                {/* Overview Cards: Overdue & Upcoming */}
+                <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:'16px',marginTop:'14px'}}>
+                  <div className="box" style={{padding:'14px'}}>
+                    <h4 style={{display:'flex',alignItems:'center',gap:'6px',color:'#f87171'}}>
+                      <AlertTriangle size={15}/> Overdue Tasks ({asBriefing?.overdue_tasks?.length || 0})
+                    </h4>
+                    {asBriefing?.overdue_tasks?.length === 0 ? (
+                      <p style={{fontSize:'11px',color:'#64748b',marginTop:'8px'}}>No overdue tasks. All clear!</p>
+                    ) : (
+                      asBriefing?.overdue_tasks?.map((t: any) => (
+                        <div key={t.id} style={{padding:'8px 0',borderTop:'1px solid #1e293b',fontSize:'11px'}}>
+                          <b>{t.title}</b>
+                          <div style={{color:'#94a3b8',fontSize:'10px',marginTop:'2px'}}>
+                            Due: <span style={{color:'#f87171'}}>{t.deadline}</span> · Priority: {t.priority}
+                          </div>
+                        </div>
+                      ))
+                    )}
+                  </div>
+
+                  <div className="box" style={{padding:'14px'}}>
+                    <h4 style={{display:'flex',alignItems:'center',gap:'6px',color:'#60a5fa'}}>
+                      <Clock3 size={15}/> Upcoming Deadlines (Next 72h) ({asBriefing?.upcoming_deadlines?.length || 0})
+                    </h4>
+                    {asBriefing?.upcoming_deadlines?.length === 0 ? (
+                      <p style={{fontSize:'11px',color:'#64748b',marginTop:'8px'}}>No imminent deadlines approaching in the next 72 hours.</p>
+                    ) : (
+                      asBriefing?.upcoming_deadlines?.map((t: any) => (
+                        <div key={t.id} style={{padding:'8px 0',borderTop:'1px solid #1e293b',fontSize:'11px'}}>
+                          <b>{t.title}</b>
+                          <div style={{color:'#94a3b8',fontSize:'10px',marginTop:'2px'}}>
+                            Due: <span style={{color:'#60a5fa'}}>{t.deadline}</span> · Priority: {t.priority}
+                          </div>
+                        </div>
+                      ))
+                    )}
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* TAB 2: REMINDERS */}
+            {asTab === 'reminders' && (
+              <div>
+                <div className="box" style={{padding:'16px',marginBottom:'16px'}}>
+                  <h4><Plus size={14}/> Schedule New Intelligent Reminder</h4>
+                  <div style={{display:'grid',gridTemplateColumns:'2fr 1.5fr 1fr auto',gap:'10px',marginTop:'10px'}}>
+                    <input
+                      placeholder="Reminder title (e.g. Weekly project sync)"
+                      value={remTitle}
+                      onChange={e => setRemTitle(e.target.value)}
+                    />
+                    <input
+                      type="datetime-local"
+                      value={remDueAt}
+                      onChange={e => setRemDueAt(e.target.value)}
+                    />
+                    <select value={remType} onChange={e => setRemType(e.target.value)}>
+                      <option value="one_time">One-time</option>
+                      <option value="daily">Daily</option>
+                      <option value="weekly">Weekly</option>
+                      <option value="deadline">Deadline</option>
+                      <option value="follow_up">Follow-up</option>
+                    </select>
+                    <button className="primary" onClick={createReminderAction}>Set Reminder</button>
+                  </div>
+                </div>
+
+                <div>
+                  {asReminders.length === 0 ? (
+                    <div className="box" style={{padding:'20px',textAlign:'center',color:'#64748b'}}>
+                      No reminders scheduled. Use the form above to add one.
+                    </div>
+                  ) : (
+                    asReminders.map((r: any) => (
+                      <div key={r.id} className="as-rem-card">
+                        <div className="as-rem-info">
+                          <div className="as-rem-title">{r.title}</div>
+                          <div className="as-rem-meta">
+                            <span className={`as-pill ${r.status}`}>{r.status}</span>
+                            <span>Type: <b>{r.reminder_type}</b></span>
+                            <span>Due: <b>{r.due_at}</b></span>
+                            {r.snoozed_until && <span>Snoozed until: <b>{r.snoozed_until}</b></span>}
+                          </div>
+                        </div>
+                        <div style={{display:'flex',gap:'6px'}}>
+                          {(r.status === 'pending' || r.status === 'snoozed') && (
+                            <>
+                              <button className="secondary" style={{padding:'4px 8px',fontSize:'10px'}} onClick={() => snoozeReminder(r.id, 15)}>
+                                +15m
+                              </button>
+                              <button className="secondary" style={{padding:'4px 8px',fontSize:'10px'}} onClick={() => snoozeReminder(r.id, 60)}>
+                                +1h
+                              </button>
+                            </>
+                          )}
+                          {r.status !== 'dismissed' && (
+                            <button className="ghost" style={{padding:'4px 8px',fontSize:'10px'}} onClick={() => dismissReminder(r.id)}>
+                              Dismiss
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                    ))
+                  )}
+                </div>
+              </div>
+            )}
+
+            {/* TAB 3: MONITORS */}
+            {asTab === 'monitors' && (
+              <div>
+                <div className="box" style={{padding:'16px',marginBottom:'16px'}}>
+                  <h4><Plus size={14}/> Add Continuous Proactive Monitor</h4>
+                  <div style={{display:'grid',gridTemplateColumns:'1.5fr 1.5fr 1fr 1fr auto',gap:'10px',marginTop:'10px'}}>
+                    <input
+                      placeholder="Monitor name (e.g. Watch Overdue Tasks)"
+                      value={monName}
+                      onChange={e => setMonName(e.target.value)}
+                    />
+                    <select value={monType} onChange={e => setMonType(e.target.value)}>
+                      <option value="task_overdue">Task Overdue</option>
+                      <option value="scheduler_failure">Scheduler Failure Alert</option>
+                      <option value="pending_approval">Pending Approval Age</option>
+                      <option value="file_change">File Change Watch</option>
+                      <option value="recurring_due">Recurring Automation Health</option>
+                    </select>
+                    <input
+                      placeholder="Target path or *"
+                      value={monTarget}
+                      onChange={e => setMonTarget(e.target.value)}
+                    />
+                    <input
+                      type="number"
+                      placeholder="Threshold (sec)"
+                      value={monThreshold}
+                      onChange={e => setMonThreshold(Number(e.target.value))}
+                    />
+                    <button className="primary" onClick={createMonitorAction}>Create Monitor</button>
+                  </div>
+                </div>
+
+                <div>
+                  {asMonitors.map((m: any) => (
+                    <div key={m.id} className="as-mon-card">
+                      <div>
+                        <div style={{fontSize:'12px',fontWeight:600,color:'#f1f5f9'}}>{m.name}</div>
+                        <div style={{fontSize:'10px',color:'#94a3b8',marginTop:'3px',display:'flex',gap:'10px'}}>
+                          <span>Type: <b>{m.monitor_type}</b></span>
+                          <span>Target: <b>{m.target_identifier}</b></span>
+                          <span>Threshold: <b>{m.threshold_seconds}s</b></span>
+                          {m.last_alert_at && <span style={{color:'#fbbf24'}}>Last Alert: {m.last_alert_at}</span>}
+                        </div>
+                      </div>
+                      <div style={{display:'flex',gap:'8px',alignItems:'center'}}>
+                        <button
+                          className={m.enabled ? 'primary' : 'secondary'}
+                          style={{padding:'4px 10px',fontSize:'10px'}}
+                          onClick={() => toggleMonitor(m.id, !m.enabled)}
+                        >
+                          {m.enabled ? 'Enabled' : 'Paused'}
+                        </button>
+                        <button className="ghost" style={{padding:'4px 8px'}} onClick={() => deleteMonitor(m.id)}>
+                          <Trash2 size={13}/>
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* TAB 4: DAILY PLAN */}
+            {asTab === 'plan' && (
+              <div className="as-layout">
+                {asDailyPlan && (
+                  <>
+                    <div className="box" style={{padding:'16px'}}>
+                      <div style={{display:'flex',justifyContent:'space-between',alignItems:'center'}}>
+                        <div>
+                          <h4 style={{margin:0}}>Optimized Schedule for {asDailyPlan.date}</h4>
+                          <small style={{color:'#94a3b8'}}>{asDailyPlan.total_tasks} tasks scheduled · Total estimated workload: {asDailyPlan.total_estimated_hours} hours</small>
+                        </div>
+                      </div>
+
+                      {asDailyPlan.conflicts && asDailyPlan.conflicts.length > 0 && (
+                        <div style={{background:'rgba(239,68,68,0.1)',border:'1px solid #ef4444',borderRadius:'6px',padding:'10px 14px',marginTop:'12px'}}>
+                          <b style={{color:'#ef4444',fontSize:'11px',display:'flex',alignItems:'center',gap:'6px'}}>
+                            <AlertTriangle size={14}/> Schedule Conflicts Detected ({asDailyPlan.conflicts.length})
+                          </b>
+                          {asDailyPlan.conflicts.map((cf: any, idx: number) => (
+                            <div key={idx} style={{fontSize:'10px',color:'#fca5a5',marginTop:'3px'}}>
+                              • {cf.title || cf.date}: {cf.details}
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+
+                    <div className="box" style={{padding:'16px'}}>
+                      <h4 style={{marginBottom:'10px'}}>Sequenced Daily Execution Plan</h4>
+                      <div className="files-table-wrapper">
+                        <table className="files-table">
+                          <thead>
+                            <tr>
+                              <th>Seq</th>
+                              <th>Task Title</th>
+                              <th>Priority</th>
+                              <th>Project</th>
+                              <th>Est. Duration</th>
+                              <th>Cumulative Time</th>
+                              <th>Deadline</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {asDailyPlan.plan?.map((t: any, idx: number) => (
+                              <tr key={t.id}>
+                                <td>#{idx + 1}</td>
+                                <td><b>{t.title}</b></td>
+                                <td>
+                                  <span className={`as-pill ${t.priority === 'critical' ? 'missed' : t.priority === 'high' ? 'snoozed' : 'pending'}`}>
+                                    {t.priority}
+                                  </span>
+                                </td>
+                                <td>{t.project}</td>
+                                <td>{t.duration_minutes} mins</td>
+                                <td>{Math.round(t.cumulative_minutes / 60 * 10) / 10} hrs</td>
+                                <td>{t.deadline || '—'}</td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+                  </>
+                )}
+              </div>
+            )}
+
+            {/* TAB 5: PROFILE & PREFERENCES */}
+            {asTab === 'profile' && (
+              <div>
+                <div className="as-profile-grid">
+                  {/* Working Hours */}
+                  <div className="as-profile-card">
+                    <h4><Clock3 size={14}/> Working Hours & Availability</h4>
+                    <div style={{fontSize:'11px',color:'#94a3b8',lineHeight:'1.8'}}>
+                      <div>Daily Window: <b style={{color:'#f1f5f9'}}>{asProfile?.working_hours?.start_time || '09:00'} – {asProfile?.working_hours?.end_time || '18:00'}</b></div>
+                      <div>Timezone: <b style={{color:'#f1f5f9'}}>{asProfile?.working_hours?.timezone || 'Local'}</b></div>
+                      <div>Active Work Days: <b style={{color:'#f1f5f9'}}>Monday – Friday</b></div>
+                    </div>
+                  </div>
+
+                  {/* Goals & Projects */}
+                  <div className="as-profile-card">
+                    <h4><Workflow size={14}/> Ongoing Projects & Goals</h4>
+                    <div style={{fontSize:'11px',color:'#94a3b8'}}>
+                      <div>Projects: <b style={{color:'#60a5fa'}}>{asProfile?.projects?.map((p: any) => typeof p === 'string' ? p : p.name).join(', ') || 'General'}</b></div>
+                      <div style={{marginTop:'4px'}}>Communication: <b style={{color:'#34d399'}}>{asProfile?.communication_style || 'concise'}</b></div>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Add Preference */}
+                <div className="box" style={{padding:'14px',margin:'14px 0'}}>
+                  <h4><Plus size={14}/> Add Profile Preference / Goal</h4>
+                  <div style={{display:'grid',gridTemplateColumns:'1.5fr 2fr 1fr auto',gap:'10px',marginTop:'8px'}}>
+                    <input placeholder="Key (e.g. preferred_editor)" value={newPrefKey} onChange={e => setNewPrefKey(e.target.value)}/>
+                    <input placeholder="Value (e.g. VS Code)" value={newPrefVal} onChange={e => setNewPrefVal(e.target.value)}/>
+                    <select value={newPrefCat} onChange={e => setNewPrefCat(e.target.value)}>
+                      <option value="preferences">Preferences</option>
+                      <option value="goals">Goals</option>
+                      <option value="projects">Projects</option>
+                      <option value="routines">Routines</option>
+                    </select>
+                    <button className="primary" onClick={createProfileItem}>Save Item</button>
+                  </div>
+                </div>
+
+                {/* Profile Items Table */}
+                <div className="box" style={{padding:'14px'}}>
+                  <h4>Stored Profile Items & Confidence Level</h4>
+                  <small style={{color:'#94a3b8'}}>Strict distinction between user-confirmed facts and assistant-inferred preferences. Credentials and API keys are blocked.</small>
+                  <div className="files-table-wrapper" style={{marginTop:'10px'}}>
+                    <table className="files-table">
+                      <thead>
+                        <tr>
+                          <th>Key</th>
+                          <th>Value</th>
+                          <th>Category</th>
+                          <th>Confirmation Status</th>
+                          <th>Source</th>
+                          <th>Action</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {asProfile?.items?.map((it: any) => (
+                          <tr key={it.key}>
+                            <td><b>{it.key}</b></td>
+                            <td>{typeof it.value === 'object' ? JSON.stringify(it.value) : String(it.value)}</td>
+                            <td>{it.category}</td>
+                            <td>
+                              <span className={`as-pill ${it.is_confirmed ? 'confirmed' : 'inferred'}`}>
+                                {it.is_confirmed ? 'Confirmed Fact' : 'Inferred Preference'}
+                              </span>
+                            </td>
+                            <td>{it.source}</td>
+                            <td>
+                              {!it.is_confirmed && (
+                                <button
+                                  className="secondary"
+                                  style={{padding:'2px 6px',fontSize:'9px'}}
+                                  onClick={() => confirmProfileItem(it.key, it.value, it.category)}
+                                >
+                                  Confirm
+                                </button>
+                              )}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* TAB 6: NOTIFICATIONS */}
+            {asTab === 'notifications' && (
+              <div>
+                <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:'12px'}}>
+                  <h4>Persistent Notification Center ({asNotifications.length})</h4>
+                  <small style={{color:'#94a3b8'}}>{asUnreadCount} unread alert(s)</small>
+                </div>
+
+                {asNotifications.length === 0 ? (
+                  <div className="box" style={{padding:'20px',textAlign:'center',color:'#64748b'}}>
+                    No notifications recorded.
+                  </div>
+                ) : (
+                  asNotifications.map((n: any) => (
+                    <div key={n.id} className={`as-notif-card ${n.severity} ${n.read_status ? 'read' : ''}`}>
+                      <div>
+                        <div style={{display:'flex',alignItems:'center',gap:'8px'}}>
+                          <span className={`as-pill ${n.severity}`}>{n.severity}</span>
+                          <b style={{fontSize:'12px',color:'#f1f5f9'}}>{n.title}</b>
+                          <small style={{fontSize:'10px',color:'#64748b'}}>{n.created_at}</small>
+                        </div>
+                        <p style={{fontSize:'11px',color:'#cbd5e1',margin:'4px 0 0 0'}}>{n.message}</p>
+                      </div>
+                      <div style={{display:'flex',gap:'6px'}}>
+                        <button className="ghost" style={{padding:'4px 8px',fontSize:'10px'}} onClick={() => dismissNotification(n.id)}>
+                          Dismiss
+                        </button>
+                      </div>
+                    </div>
+                  ))
+                )}
+              </div>
+            )}
+          </>}
+
+          {!['Overview','Assistant','Chat','Tool Registry','Models','Settings','Activity Log','Browser','Tasks','Memory','Desktop','Visual AI','Files'].includes(page)&&(
             <div className="coming">
               <Sparkles/>
               <h1>{page}</h1>

@@ -9,6 +9,7 @@ from app.browser import browser, register_browser_tools
 from app.desktop import register_desktop_tools
 from app.vision import register_vision_tools
 from app.files import register_file_tools
+from app.assistant import register_assistant_tools, assistant_engine
 from app.api.routes import r
 
 app = FastAPI(title="LAPTOP AI API", version="0.5.0")
@@ -32,6 +33,8 @@ async def start():
     register_desktop_tools()
     register_vision_tools()
     register_file_tools()
+    register_assistant_tools()
+    assistant_engine.recover_on_startup()
     await mcp.load_all_enabled()
     task_scheduler.start()
 

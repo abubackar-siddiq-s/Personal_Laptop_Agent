@@ -248,6 +248,13 @@ def filter_relevant_tools(
         "ask", "compare", "search", "semantic", "index", "duplicate", "duplicates",
         "organize", "cleanup", "quarantine", "extract", "profile"
     }
+    assistant_keywords = {
+        "assistant", "profile", "preference", "preferences", "goal", "goals", "project",
+        "projects", "routine", "routines", "working", "hours", "remind", "reminder", "reminders",
+        "snooze", "briefing", "brief", "daily", "today", "overdue", "deadline", "deadlines",
+        "monitor", "monitors", "alert", "alerts", "notification", "notifications",
+        "prioritize", "priority", "what should i work on", "plan", "morning"
+    }
     system_keywords = {
         "cpu", "ram", "memory", "battery", "disk", "hardware", "process",
         "processes", "kill", "terminate", "inspect", "file", "folder",
@@ -266,6 +273,12 @@ def filter_relevant_tools(
         )
     )
     wants_files = bool(words & files_keywords)
+    wants_assistant = bool(words & assistant_keywords) or any(
+        k in text_corpus for k in (
+            "what should i work on", "daily briefing", "remind me", "my profile",
+            "working hours", "set a reminder", "what are my deadlines"
+        )
+    )
     wants_system = bool(words & system_keywords)
     wants_mcp = bool(words & mcp_keywords)
     wants_approval = bool(words & approval_keywords)
@@ -337,6 +350,12 @@ def filter_relevant_tools(
                 if fn_name in ("files_organize_preview", "files_organize_execute") and any(k in text_corpus for k in ("organize", "cleanup", "quarantine", "move", "large", "old", "empty")):
                     selected.append(t)
                     continue
+                selected.append(t)
+                continue
+
+        # Proactive Assistant Tools Scoping
+        if fn_name.startswith("assistant_") or fn_name.startswith("assistant."):
+            if wants_assistant:
                 selected.append(t)
                 continue
 
