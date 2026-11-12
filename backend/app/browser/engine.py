@@ -374,8 +374,14 @@ class BrowserEngine:
             "text": text.strip()[:200],
         }
 
+    def _assert_not_stopped(self):
+        from app.core.emergency import is_emergency_stopped
+        if is_emergency_stopped():
+            raise PermissionError("Browser execution blocked: Global Emergency Stop is currently engaged.")
+
     async def click(self, selector: str, selector_type: str = "semantic") -> dict:
         """Click an element on the active page."""
+        self._assert_not_stopped()
         page = await self.get_active_page()
         loc = self._resolve_locator(page, selector, selector_type).first
         await loc.click(timeout=ACTION_TIMEOUT_MS)
@@ -384,6 +390,7 @@ class BrowserEngine:
 
     async def fill(self, selector: str, text: str, selector_type: str = "semantic") -> dict:
         """Fill an input field with text."""
+        self._assert_not_stopped()
         page = await self.get_active_page()
         loc = self._resolve_locator(page, selector, selector_type).first
         await loc.fill(text, timeout=ACTION_TIMEOUT_MS)
@@ -392,6 +399,7 @@ class BrowserEngine:
 
     async def type(self, selector: str, text: str, selector_type: str = "semantic", delay_ms: int = 50) -> dict:
         """Type characters sequentially into an input."""
+        self._assert_not_stopped()
         page = await self.get_active_page()
         loc = self._resolve_locator(page, selector, selector_type).first
         await loc.press_sequentially(text, delay=delay_ms, timeout=ACTION_TIMEOUT_MS)
@@ -400,6 +408,7 @@ class BrowserEngine:
 
     async def select(self, selector: str, value: str, selector_type: str = "semantic") -> dict:
         """Select an option from a <select> dropdown."""
+        self._assert_not_stopped()
         page = await self.get_active_page()
         loc = self._resolve_locator(page, selector, selector_type).first
         res = await loc.select_option(value=value, timeout=ACTION_TIMEOUT_MS)
@@ -408,6 +417,7 @@ class BrowserEngine:
 
     async def press_key(self, key: str) -> dict:
         """Press a keyboard key (Enter, Escape, Tab, ArrowDown, etc.)."""
+        self._assert_not_stopped()
         page = await self.get_active_page()
         await page.keyboard.press(key)
         audit("browser.press_key", key)

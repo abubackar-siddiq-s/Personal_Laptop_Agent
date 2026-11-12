@@ -390,3 +390,4 @@ class TaskIntelligenceEngine:
             "schedule_by_day": days,
             "unassigned_tasks": unassigned,
         }
+

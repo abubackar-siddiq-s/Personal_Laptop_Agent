@@ -301,3 +301,4 @@ class MonitorManager:
         if alerts:
             logger.info(f"[MonitorManager] Evaluated monitors, generated {len(alerts)} alert(s)")
         return alerts
+

@@ -356,3 +356,4 @@ def register_assistant_tools():
     )
 
     logger.info("[assistant.tools] Registered 15 Proactive Personal Assistance tools.")
+

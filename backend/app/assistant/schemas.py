@@ -130,3 +130,4 @@ class TaskPrioritization(BaseModel):
     deadline: Optional[str] = None
     estimated_duration_minutes: int = 30
     conflict_warning: Optional[str] = None
+

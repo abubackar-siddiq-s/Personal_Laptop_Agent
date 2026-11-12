@@ -188,8 +188,33 @@ export default function App() {
   const [newPrefVal, setNewPrefVal] = useState('');
   const [newPrefCat, setNewPrefCat] = useState('preferences');
 
+  let [localSessionToken, setLocalSessionToken] = useState<string>('');
+
+  async function ensureSession(): Promise<string> {
+    if (localSessionToken) return localSessionToken;
+    try {
+      let r = await fetch(API + '/auth/session');
+      if (r.ok) {
+        let d = await r.json();
+        let tok = d.session_token || '';
+        setLocalSessionToken(tok);
+        return tok;
+      }
+    } catch (_) {}
+    return '';
+  }
+
   async function req(path:string,init?:RequestInit) {
-    let r = await fetch(API+path,{headers:{'Content-Type':'application/json'},...init});
+    let token = localSessionToken;
+    if (!token && !path.startsWith('/auth/session')) {
+      token = await ensureSession();
+    }
+    let headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+      ...(token ? { 'X-Session-Token': token } : {}),
+      ...(init?.headers as Record<string, string> || {}),
+    };
+    let r = await fetch(API+path,{...init, headers});
     let d = await r.json();
     if(!r.ok) throw Error(d.detail||'Request failed');
     return d;

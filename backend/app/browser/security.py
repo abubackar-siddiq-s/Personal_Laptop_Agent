@@ -27,6 +27,10 @@ def validate_browser_url(url: str, allow_local: bool = False) -> str:
     Validate URL scheme, host, and network destination for security.
     Blocks private IPs, loopback, file://, and cloud metadata unless allow_local is True.
     """
+    from app.core.emergency import is_emergency_stopped
+    if is_emergency_stopped():
+        raise PermissionError("Browser navigation blocked: Global Emergency Stop is currently engaged.")
+
     u = url.strip()
     if not u:
         raise ValueError("URL cannot be empty.")

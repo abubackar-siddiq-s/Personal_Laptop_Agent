@@ -301,8 +301,13 @@ class AgentEngine:
                 fallback_occurred=False,
             )
 
-    async def _execute_tool_call(self, tool_call: ToolCall, conversation_id: int | None = None) -> tuple[dict, ToolExecutionRecord]:
-        """Validate, permission-check, and execute a tool call safely."""
+    async def _execute_tool_call(
+        self,
+        tool_call: ToolCall,
+        conversation_id: int | None = None,
+        existing_executions: list[ToolExecutionRecord] | None = None,
+    ) -> tuple[dict, ToolExecutionRecord]:
+        """Validate, permission-check, and execute a tool call safely with fallback idempotency."""
         provider_fn_name = tool_call.name
         reg_name = registry.from_provider_name(provider_fn_name)
         args = tool_call.args
@@ -311,6 +316,24 @@ class AgentEngine:
             err = f"Tool '{provider_fn_name}' is not recognized or not registered."
             rec = ToolExecutionRecord(tool_name=provider_fn_name, arguments=args, success=False, error=err)
             return {"error": err, "success": False}, rec
+
+        # Provider fallback idempotency: Never repeat a completed consequential tool action
+        if existing_executions:
+            clean_args = json.dumps(args, sort_keys=True, default=str)
+            for prev in existing_executions:
+                if prev.tool_name == reg_name and json.dumps(prev.arguments, sort_keys=True, default=str) == clean_args:
+                    if prev.success:
+                        logger.info("Idempotency guard: avoiding re-execution of completed tool '%s' on fallback.", reg_name)
+                        return prev.result, prev
+                    elif prev.approval_id:
+                        logger.info("Idempotency guard: avoiding duplicate approval queue for tool '%s'.", reg_name)
+                        return {
+                            "status": "approval_required",
+                            "approval_id": prev.approval_id,
+                            "tool_name": reg_name,
+                            "risk": "approval",
+                            "message": f"Action is already awaiting user approval (Approval #{prev.approval_id}).",
+                        }, prev
 
         spec = registry.items[reg_name]
 
@@ -409,8 +432,11 @@ class AgentEngine:
                 messages.append(turn_res.raw_message)
 
             for tc in turn_res.tool_calls:
-                tool_result, record = await self._execute_tool_call(tc, conversation_id=conversation_id)
-                executions.append(record)
+                tool_result, record = await self._execute_tool_call(
+                    tc, conversation_id=conversation_id, existing_executions=executions
+                )
+                if record not in executions:
+                    executions.append(record)
 
                 content_str = sanitize_tool_result_for_llm(tool_result, max_chars=max_tool_chars)
 
@@ -490,8 +516,11 @@ class AgentEngine:
                 contents.append(turn_res.raw_message)
 
             for tc in turn_res.tool_calls:
-                tool_result, record = await self._execute_tool_call(tc, conversation_id=conversation_id)
-                executions.append(record)
+                tool_result, record = await self._execute_tool_call(
+                    tc, conversation_id=conversation_id, existing_executions=executions
+                )
+                if record not in executions:
+                    executions.append(record)
 
                 if isinstance(tool_result, dict):
                     cleaned_gemini_result = dict(tool_result)

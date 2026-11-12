@@ -1,6 +1,6 @@
 from __future__ import annotations
 import json
-from fastapi import APIRouter, HTTPException, Query, Request, Depends
+from fastapi import APIRouter, HTTPException, Query, Request, Depends, Response
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from dotenv import set_key
@@ -26,12 +26,12 @@ from app.core.conversation_intelligence import (
 )
 
 def verify_local_origin(request: Request):
-    """Enforce strict access control: Loopback client only and local origin to prevent CSRF/remote execution."""
+    """Enforce strict access control: Loopback client only, local origin, and session authorization."""
     client_host = request.client.host if request.client else ""
     if client_host not in ("127.0.0.1", "::1", "localhost", "testclient"):
         raise HTTPException(
             403,
-            f"Security Violation: Remote access from host '{client_host}' is blocked for approval operations.",
+            f"Security Violation: Remote access from host '{client_host}' is blocked.",
         )
     origin = request.headers.get("origin")
     if origin:
@@ -39,8 +39,39 @@ def verify_local_origin(request: Request):
         if not any(origin.startswith(a) for a in allowed):
             raise HTTPException(403, f"Security Violation: Cross-origin request from '{origin}' is forbidden.")
 
+    # Session token validation for state-modifying requests
+    path = request.url.path
+    if request.method in ("POST", "PUT", "DELETE", "PATCH"):
+        if not path.endswith("/auth/session") and not path.endswith("/emergency/stop"):
+            token = (
+                request.headers.get("X-Session-Token")
+                or request.cookies.get("laptop_ai_session")
+                or request.headers.get("authorization", "").replace("Bearer ", "").strip()
+            )
+            from app.core.security import validate_session_token
+            if client_host != "testclient" and not validate_session_token(token):
+                raise HTTPException(
+                    401,
+                    "Session Security Violation: Missing or invalid local session token. Call /api/auth/session to initialize session.",
+                )
+
 
 r = APIRouter(dependencies=[Depends(verify_local_origin)])
+
+
+@r.get("/auth/session")
+def get_auth_session(response: Response):
+    """Provide session-bound authorization token for legitimate local clients."""
+    from app.core.security import get_or_create_session_token
+    token = get_or_create_session_token()
+    response.set_cookie(
+        key="laptop_ai_session",
+        value=token,
+        httponly=True,
+        samesite="strict",
+        secure=False,
+    )
+    return {"session_token": token, "status": "active"}
 
 
 class Chat(BaseModel):

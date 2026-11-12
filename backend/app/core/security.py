@@ -1,7 +1,46 @@
 from __future__ import annotations
+import hmac
 import os
+import re
+import secrets
 from pathlib import Path
 from app.core.db import conn
+
+# Session-bound authentication token for local API access
+_SESSION_TOKEN: str | None = None
+
+SENSITIVE_PATTERNS = [
+    re.compile(r"AIza[0-9A-Za-z-_]{28,}"),
+    re.compile(r"gsk_[a-zA-Z0-9]{20,}"),
+    re.compile(r"sk-[a-zA-Z0-9_-]{20,}"),
+    re.compile(r"ghp_[a-zA-Z0-9]{36}"),
+    re.compile(r"(?i)\b(bearer\s+[a-zA-Z0-9_\-\.]{12,})"),
+]
+
+
+def sanitize_sensitive_strings(text: any) -> str:
+    """Redact sensitive keys, tokens, and authorization strings from logs and output."""
+    s = str(text)
+    for p in SENSITIVE_PATTERNS:
+        s = p.sub("[REDACTED_SECRET]", s)
+    return s
+
+
+def get_or_create_session_token() -> str:
+    """Generate or retrieve the process-bound local session token."""
+    global _SESSION_TOKEN
+    if _SESSION_TOKEN is None:
+        _SESSION_TOKEN = secrets.token_hex(32)
+    return _SESSION_TOKEN
+
+
+def validate_session_token(token: str | None) -> bool:
+    """Validate session token using constant-time comparison."""
+    if not token:
+        return False
+    current = get_or_create_session_token()
+    return hmac.compare_digest(str(token).strip(), current)
+
 
 # Standard approved user directory roots
 APPROVED_ROOT_NAMES = ("Documents", "Desktop", "Downloads")
@@ -64,5 +103,6 @@ def allowed(path: str | Path) -> bool:
 
 
 def audit(event: str, detail: any):
+    safe_detail = sanitize_sensitive_strings(detail)[:3000]
     with conn() as c:
-        c.execute("INSERT INTO audit(event, detail) VALUES (?, ?)", (event, str(detail)[:3000]))
+        c.execute("INSERT INTO audit(event, detail) VALUES (?, ?)", (event, safe_detail))

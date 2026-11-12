@@ -248,3 +248,4 @@ class DailyBriefingGenerator:
                 lines.append(f"- {sa['task_name']} (Next: {sa['next_run_at']})")
 
         return "\n".join(lines)
+
