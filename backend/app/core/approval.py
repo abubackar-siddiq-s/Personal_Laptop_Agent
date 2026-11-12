@@ -153,6 +153,21 @@ class ApprovalLifecycle:
                             "operation_id": operation_id,
                             "uncertain_recovery": True,
                         }
+                    else:
+                        # For rejected, expired, or other terminal states: return existing record to prevent unique collision
+                        return {
+                            "id": ex_dict["id"],
+                            "approval_token": ex_dict["approval_token"],
+                            "tool_name": ex_dict["tool_name"],
+                            "args": args,
+                            "status": ex_dict["status"],
+                            "risk": ex_dict.get("risk", risk),
+                            "created_at": ex_dict["created_at"],
+                            "expires_at": ex_dict.get("expires_at"),
+                            "conversation_id": ex_dict.get("conversation_id"),
+                            "operation_id": operation_id,
+                            "deduplicated": True,
+                        }
 
             cursor = c.execute(
                 """

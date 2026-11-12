@@ -37,18 +37,25 @@ BOOTSTRAP_FILE_PATH = Path.home() / ".laptop_ai" / "bootstrap.token"
 def get_or_create_bootstrap_secret() -> str:
     """
     Generate or retrieve the local bootstrap secret.
-    Stored securely in %USERPROFILE%/.laptop_ai/bootstrap.token with restricted permissions.
-    Also syncs to frontend/public/bootstrap.json so the trusted local Vite dev origin can bootstrap.
+    Stored exclusively in backend-protected storage (%USERPROFILE%/.laptop_ai/bootstrap.token)
+    with restricted permissions (0o600).
+    Never copied to public frontend assets or exposed via unauthenticated endpoints.
     """
     global _BOOTSTRAP_SECRET
     if _BOOTSTRAP_SECRET is not None:
+        return _BOOTSTRAP_SECRET
+
+    # Check environment variable first if operator configured explicit credential
+    env_secret = os.getenv("LAPTOP_AI_BOOTSTRAP_SECRET", "").strip()
+    if len(env_secret) >= 32:
+        _BOOTSTRAP_SECRET = env_secret
         return _BOOTSTRAP_SECRET
 
     # Check if existing token file exists and is non-empty
     if BOOTSTRAP_FILE_PATH.is_file():
         try:
             content = BOOTSTRAP_FILE_PATH.read_text(encoding="utf-8").strip()
-            if len(content) == 64:
+            if len(content) >= 32:
                 _BOOTSTRAP_SECRET = content
         except Exception:
             pass
@@ -62,20 +69,8 @@ def get_or_create_bootstrap_secret() -> str:
                 os.chmod(BOOTSTRAP_FILE_PATH, 0o600)
             except Exception:
                 pass
-        except Exception as e:
+        except Exception:
             pass
-
-    # Sync to frontend/public/bootstrap.json for Vite frontend access
-    try:
-        fe_public = Path("frontend/public")
-        fe_public.mkdir(parents=True, exist_ok=True)
-        config_path = fe_public / "bootstrap.json"
-        config_path.write_text(
-            json.dumps({"bootstrap_token": _BOOTSTRAP_SECRET}),
-            encoding="utf-8",
-        )
-    except Exception:
-        pass
 
     return _BOOTSTRAP_SECRET
 

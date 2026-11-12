@@ -145,6 +145,14 @@ def mouse_click(
             }
         return res
 
+    except pyautogui.FailSafeException:
+        logger.warning("PyAutoGUI FailSafe triggered: cursor moved to corner by operator to interrupt automation.")
+        audit("desktop.failsafe_triggered", "Automation interrupted via PyAutoGUI fail-safe corner")
+        return {
+            "success": False,
+            "error": "PyAutoGUI FailSafeException: Mouse cursor was moved to a fail-safe corner. Automation was intentionally interrupted by operator.",
+            "interrupted_by_failsafe": True,
+        }
     except Exception as e:
         logger.error("Mouse click failed: %s", e)
         return {"success": False, "error": f"Mouse click failed: {type(e).__name__}: {str(e)}"}
@@ -156,7 +164,7 @@ def mouse_scroll(
     x: Optional[int] = None,
     y: Optional[int] = None,
 ) -> dict:
-    """Scroll vertically or horizontally."""
+    """Scroll vertically or horizontally. Preserves native PyAutoGUI fail-safe."""
     try:
         verify_desktop_available()
         ensure_default_desktop()
@@ -173,15 +181,6 @@ def mouse_scroll(
         sw, sh = get_screen_dimensions()
         if 0 <= x <= sw and 0 <= y <= sh:
             pyautogui.moveTo(x, y)
-    else:
-        # Check if cursor is parked in failsafe corner (0, 0)
-        try:
-            cur_pos = pyautogui.position()
-            if cur_pos[0] == 0 and cur_pos[1] == 0:
-                sw, sh = get_screen_dimensions()
-                pyautogui.moveTo(sw // 2, sh // 2)
-        except Exception:
-            pass
 
     amount = clicks * 120
     try:
@@ -203,6 +202,14 @@ def mouse_scroll(
         audit("desktop.mouse_scroll", f"Scrolled {dir_norm} by {clicks} notches")
         return {"success": True, "direction": dir_norm, "clicks": clicks}
 
+    except pyautogui.FailSafeException:
+        logger.warning("PyAutoGUI FailSafe triggered: cursor moved to corner by operator to interrupt automation.")
+        audit("desktop.failsafe_triggered", "Automation interrupted via PyAutoGUI fail-safe corner")
+        return {
+            "success": False,
+            "error": "PyAutoGUI FailSafeException: Mouse cursor was moved to a fail-safe corner. Automation was intentionally interrupted by operator.",
+            "interrupted_by_failsafe": True,
+        }
     except Exception as e:
         logger.error("Mouse scroll failed: %s", e)
         return {"success": False, "error": f"Mouse scroll failed: {type(e).__name__}: {str(e)}"}
@@ -257,6 +264,14 @@ def keyboard_type(text: str, press_enter: bool = False) -> dict:
             "active_window": active.get("title", ""),
         }
 
+    except pyautogui.FailSafeException:
+        logger.warning("PyAutoGUI FailSafe triggered during typing: automation interrupted by operator.")
+        audit("desktop.failsafe_triggered", "Typing interrupted via PyAutoGUI fail-safe corner")
+        return {
+            "success": False,
+            "error": "PyAutoGUI FailSafeException: Mouse cursor was moved to a fail-safe corner. Automation was intentionally interrupted by operator.",
+            "interrupted_by_failsafe": True,
+        }
     except Exception as e:
         logger.error("Keyboard type failed: %s", e)
         return {"success": False, "error": f"Keyboard typing failed: {type(e).__name__}: {str(e)}"}
@@ -303,6 +318,14 @@ def keyboard_press(
             "active_window": active.get("title", ""),
         }
 
+    except pyautogui.FailSafeException:
+        logger.warning("PyAutoGUI FailSafe triggered during shortcut: automation interrupted by operator.")
+        audit("desktop.failsafe_triggered", "Keyboard shortcut interrupted via PyAutoGUI fail-safe corner")
+        return {
+            "success": False,
+            "error": "PyAutoGUI FailSafeException: Mouse cursor was moved to a fail-safe corner. Automation was intentionally interrupted by operator.",
+            "interrupted_by_failsafe": True,
+        }
     except Exception as e:
         logger.error("Keyboard shortcut failed: %s", e)
         return {"success": False, "error": f"Keyboard shortcut execution failed: {type(e).__name__}: {str(e)}"}

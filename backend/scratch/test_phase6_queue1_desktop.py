@@ -190,11 +190,24 @@ class TestPhase6Queue1Desktop(unittest.TestCase):
     def test_07b_mouse_failsafe_handling(self):
         """Verify PyAutoGUI corner fail-safe triggers are safely caught without crashing."""
         import pyautogui
+        # Verify native failsafe is strictly enabled
+        self.assertTrue(pyautogui.FAILSAFE, "PyAutoGUI FAILSAFE must be strictly True")
+
+        # Scroll failsafe trigger
         with patch("pyautogui.scroll", side_effect=pyautogui.FailSafeException()):
-            res = mouse_scroll(clicks=3)
-            self.assertFalse(res.get("success"))
-            self.assertIn("failsafeexception", res.get("error", "").lower())
-        print(" [PASS] 07b. Corner fail-safe exception safely handled.")
+            res_scroll = mouse_scroll(clicks=3)
+            self.assertFalse(res_scroll.get("success"))
+            self.assertTrue(res_scroll.get("interrupted_by_failsafe"))
+            self.assertIn("failsafeexception", res_scroll.get("error", "").lower())
+
+        # Click failsafe trigger
+        with patch("pyautogui.click", side_effect=pyautogui.FailSafeException()):
+            res_click = mouse_click(x=100, y=100)
+            self.assertFalse(res_click.get("success"))
+            self.assertTrue(res_click.get("interrupted_by_failsafe"))
+            self.assertIn("failsafeexception", res_click.get("error", "").lower())
+
+        print(" [PASS] 07b. Corner fail-safe exception safely handled across mouse actions.")
 
     # -------------------------------------------------------------
     # 8. Keyboard Shortcut Allowlisting

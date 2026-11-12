@@ -5,7 +5,7 @@ import {
   RefreshCw,Check,X,Server,PanelLeftClose,Zap,Clock3,ArrowUpRight,ArrowLeft,ArrowRight,
   RotateCw,Camera,Download,ExternalLink,Trash2,Shield,Eye,Bell,User,
   AlertTriangle,Play,Pause,Calendar,Brain,Edit2,Archive,Repeat,StopCircle,
-  Monitor,MousePointer,Keyboard,FileText,Table,Filter,Copy,FileCheck,Files
+  Monitor,MousePointer,Keyboard,FileText,Table,Filter,Copy,FileCheck,Files,Lock
 } from 'lucide-react';
 
 const API = 'http://127.0.0.1:8000/api';
@@ -188,44 +188,92 @@ export default function App() {
   const [newPrefVal, setNewPrefVal] = useState('');
   const [newPrefCat, setNewPrefCat] = useState('preferences');
 
-  let [localSessionToken, setLocalSessionToken] = useState<string>('');
+  let [localSessionToken, setLocalSessionToken] = useState<string>(() => {
+    try {
+      return sessionStorage.getItem('laptop_ai_session_token') || '';
+    } catch {
+      return '';
+    }
+  });
   let [bootstrapRequired, setBootstrapRequired] = useState<boolean>(false);
   let [manualBootstrapKey, setManualBootstrapKey] = useState<string>('');
+  let [authError, setAuthError] = useState<string>('');
+
+  async function authorizeWithKey(keyToTry?: string): Promise<string> {
+    setAuthError('');
+    let bToken = (keyToTry !== undefined ? keyToTry : manualBootstrapKey || '').trim();
+    if (!bToken) {
+      try {
+        bToken = sessionStorage.getItem('laptop_ai_bootstrap_token') || '';
+      } catch {}
+    }
+    if (!bToken) {
+      setBootstrapRequired(true);
+      return '';
+    }
+    try {
+      let r = await fetch(API + '/auth/session', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ bootstrap_token: bToken }),
+      });
+      if (r.ok) {
+        let d = await r.json();
+        let tok = d.session_token || '';
+        setLocalSessionToken(tok);
+        setBootstrapRequired(false);
+        try {
+          sessionStorage.setItem('laptop_ai_session_token', tok);
+          sessionStorage.setItem('laptop_ai_bootstrap_token', bToken);
+        } catch {}
+        return tok;
+      } else {
+        let errData = await r.json().catch(() => ({}));
+        let msg = errData.detail || 'Authorization failed: Invalid bootstrap token.';
+        setAuthError(msg);
+        setBootstrapRequired(true);
+        try {
+          sessionStorage.removeItem('laptop_ai_session_token');
+        } catch {}
+      }
+    } catch (err: any) {
+      setAuthError('Connection error: could not reach authentication backend.');
+      setBootstrapRequired(true);
+    }
+    return '';
+  }
 
   async function ensureSession(): Promise<string> {
     if (localSessionToken) return localSessionToken;
     try {
-      // 1. Try reading bootstrap token from local Vite static file
-      let bToken = '';
-      try {
-        let bRes = await fetch('/bootstrap.json');
-        if (bRes.ok) {
-          let bData = await bRes.json();
-          bToken = bData.bootstrap_token || '';
-        }
-      } catch (_) {}
-
-      if (!bToken && manualBootstrapKey) {
-        bToken = manualBootstrapKey.trim();
+      let cached = sessionStorage.getItem('laptop_ai_session_token');
+      if (cached) {
+        setLocalSessionToken(cached);
+        return cached;
       }
+    } catch {}
+    return await authorizeWithKey();
+  }
 
-      if (bToken) {
-        let r = await fetch(API + '/auth/session', {
+  async function revokeSession() {
+    try {
+      if (localSessionToken) {
+        await fetch(API + '/auth/revoke', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ bootstrap_token: bToken }),
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Session-Token': localSessionToken,
+          },
         });
-        if (r.ok) {
-          let d = await r.json();
-          let tok = d.session_token || '';
-          setLocalSessionToken(tok);
-          setBootstrapRequired(false);
-          return tok;
-        }
       }
-    } catch (_) {}
+    } catch {}
+    try {
+      sessionStorage.removeItem('laptop_ai_session_token');
+      sessionStorage.removeItem('laptop_ai_bootstrap_token');
+    } catch {}
+    setLocalSessionToken('');
     setBootstrapRequired(true);
-    return '';
+    Z('Session locked / revoked. Re-authorization required.');
   }
 
   async function req(path:string,init?:RequestInit) {
@@ -1484,6 +1532,16 @@ export default function App() {
               </button>
             )}
             <span className="online"><i/> Local engine</span>
+            {localSessionToken ? (
+              <button
+                className="ghost"
+                onClick={revokeSession}
+                title="Lock session / Sign out"
+                style={{padding:'4px 8px',fontSize:11,display:'flex',alignItems:'center',gap:4,color:'#c084fc'}}
+              >
+                <Lock size={13} /> Lock
+              </button>
+            ) : null}
             <button className="ghost" onClick={() => { P('Assistant'); setAsTab('notifications'); }} title="Notifications">
               <Bell size={16}/>
               {asUnreadCount > 0 && <span className="notif-badge">{asUnreadCount}</span>}
@@ -1529,19 +1587,23 @@ export default function App() {
             <div style={{display:'flex',alignItems:'center',gap:10}}>
               <ShieldCheck size={20} color="#a855f7"/>
               <div>
-                <b style={{color:'#e9d5ff',fontSize:13}}>Session Authorization Required</b>
-                <div style={{color:'#c084fc',fontSize:11}}>Enter local bootstrap secret from <code>%USERPROFILE%\.laptop_ai\bootstrap.token</code> to authorize this browser session.</div>
+                <b style={{color:'#e9d5ff',fontSize:13}}>Local Authorization Required</b>
+                <div style={{color:'#c084fc',fontSize:11}}>
+                  Enter local bootstrap secret from <code>%USERPROFILE%\.laptop_ai\bootstrap.token</code> (or <code>LAPTOP_AI_BOOTSTRAP_SECRET</code>) to authorize this browser session.
+                </div>
+                {authError && <div style={{color:'#f87171',fontSize:11,marginTop:4,fontWeight:500}}>{authError}</div>}
               </div>
             </div>
             <div style={{display:'flex',gap:8}}>
               <input
                 type="password"
-                placeholder="Paste 64-char bootstrap key"
+                placeholder="Paste bootstrap secret..."
                 value={manualBootstrapKey}
                 onChange={e=>setManualBootstrapKey(e.target.value)}
+                onKeyDown={e=>{ if (e.key === 'Enter') authorizeWithKey(manualBootstrapKey); }}
                 style={{background:'#0f0c1b',border:'1px solid #581c87',borderRadius:6,padding:'6px 10px',color:'#fff',fontSize:12,width:260}}
               />
-              <button className="primary" onClick={()=>ensureSession()} style={{padding:'6px 14px',fontSize:12}}>Authorize</button>
+              <button className="primary" onClick={()=>authorizeWithKey(manualBootstrapKey)} style={{padding:'6px 14px',fontSize:12}}>Authorize</button>
             </div>
           </div>
         )}

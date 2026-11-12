@@ -14,6 +14,8 @@ from fastapi import HTTPException
 
 from app.main import app
 from app.api.routes import r, verify_local_origin, ALLOWED_ORIGINS
+from app.tools.native import register as reg_nat
+from app.core.emergency import clear_emergency_stop
 from app.core.security import (
     get_or_create_bootstrap_secret,
     validate_bootstrap_token,
@@ -29,10 +31,13 @@ from app.core.security import (
 class TestSessionAuthenticationSecurity(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        reg_nat()
+        clear_emergency_stop()
         cls.client = TestClient(app, base_url="http://127.0.0.1:8000")
         cls.bootstrap_secret = get_or_create_bootstrap_secret()
 
     def setUp(self):
+        clear_emergency_stop()
         # Clear client cookies between tests to ensure test isolation
         self.client.cookies.clear()
         # Generate a fresh valid session token for tests that need it
@@ -247,6 +252,113 @@ class TestSessionAuthenticationSecurity(unittest.TestCase):
             verify_local_origin(req)
         self.assertEqual(ctx.exception.status_code, 401)
         self.assertIn("Session Security Violation", ctx.exception.detail)
+
+    # 15. Public Bootstrap Asset Protection
+    def test_15_no_public_bootstrap_asset_exposure(self):
+        """Verify bootstrap secret is NEVER served as a static file in public or dist assets."""
+        fe_public_token = PROJECT_ROOT.parent / "frontend" / "public" / "bootstrap.json"
+        fe_dist_token = PROJECT_ROOT.parent / "frontend" / "dist" / "bootstrap.json"
+        self.assertFalse(fe_public_token.exists(), "frontend/public/bootstrap.json must NEVER exist")
+        self.assertFalse(fe_dist_token.exists(), "frontend/dist/bootstrap.json must NEVER exist")
+
+        # GET /api/auth/session must return status without revealing the secret
+        res = self.client.get("/api/auth/session")
+        self.assertEqual(res.status_code, 200)
+        body_str = res.text
+        self.assertNotIn(self.bootstrap_secret, body_str)
+        self.assertNotIn("bootstrap_token", body_str)
+
+    # 16. Approval Replay Protection
+    def test_16_approval_replay_protection(self):
+        """Verify replaying an approval request reuses the completed result without duplicate execution."""
+        import asyncio
+        from app.core.approval import ApprovalLifecycle, ApprovalError
+        op_id = f"op_replay_sec_test_{int(time.time()*1000)}"
+
+        # 1. First execution
+        req1 = ApprovalLifecycle.create_request("native.terminal.diagnostic", {"command_id": "whoami"}, operation_id=op_id)
+        self.assertEqual(req1["status"], "pending")
+        aid = req1["id"]
+
+        # Approve and execute
+        res1 = asyncio.run(ApprovalLifecycle.approve_and_execute(aid, expected_args={"command_id": "whoami"}))
+        self.assertEqual(res1["status"], "executed")
+
+        # Direct replay on same approval ID is blocked with HTTP 409
+        with self.assertRaises(ApprovalError) as ctx:
+            asyncio.run(ApprovalLifecycle.approve_and_execute(aid, expected_args={"command_id": "whoami"}))
+        self.assertEqual(ctx.exception.status_code, 409)
+
+        # 2. Replay attempt with same operation_id returns cached result
+        req2 = ApprovalLifecycle.create_request("native.terminal.diagnostic", {"command_id": "whoami"}, operation_id=op_id)
+        self.assertEqual(req2["id"], aid)
+        self.assertEqual(req2["status"], "executed")
+        self.assertTrue(req2.get("reused"))
+
+    # 17. Concurrent Duplicate Operation Protection
+    def test_17_concurrent_duplicate_operation_rejection(self):
+        """Verify concurrent attempts to claim the same operation_id are blocked."""
+        import asyncio
+        from app.core.approval import ApprovalLifecycle, ApprovalError
+        op_id = f"op_concurrent_sec_test_{int(time.time()*1000)}"
+
+        req = ApprovalLifecycle.create_request("native.terminal.diagnostic", {"command_id": "whoami"}, operation_id=op_id)
+        aid = req["id"]
+
+        async def run_concurrent():
+            return await asyncio.gather(
+                ApprovalLifecycle.approve_and_execute(aid, expected_args={"command_id": "whoami"}),
+                ApprovalLifecycle.approve_and_execute(aid, expected_args={"command_id": "whoami"}),
+                return_exceptions=True,
+            )
+
+        results = asyncio.run(run_concurrent())
+        successes = [r for r in results if isinstance(r, dict) and r.get("status") == "executed"]
+        conflicts = [r for r in results if isinstance(r, ApprovalError) and r.status_code == 409]
+        self.assertEqual(len(successes), 1)
+        self.assertEqual(len(conflicts), 1)
+
+    # 18. Emergency Stop Enforcement
+    def test_18_emergency_stop_blocks_consequential_tools(self):
+        """Verify active Emergency Stop universally blocks tool execution."""
+        from app.core.emergency import trigger_emergency_stop, clear_emergency_stop, is_emergency_stopped
+        from app.desktop.actions import mouse_click
+
+        trigger_emergency_stop("Security regression test stop")
+        self.assertTrue(is_emergency_stopped())
+
+        try:
+            # Emergency stop blocks desktop actions
+            res = mouse_click(x=100, y=100)
+            self.assertFalse(res.get("success"))
+            self.assertIn("emergency stop", res.get("error", "").lower())
+        finally:
+            clear_emergency_stop()
+            self.assertFalse(is_emergency_stopped())
+
+    # 19. Mouse Fail-Safe Behavior
+    def test_19_mouse_failsafe_operator_interruption(self):
+        """Verify PyAutoGUI failsafe is enabled and operator interruption is reliably caught."""
+        import pyautogui
+        from unittest.mock import patch
+        from app.desktop.actions import mouse_scroll, mouse_click
+
+        # Native failsafe flag must be True
+        self.assertTrue(pyautogui.FAILSAFE, "PyAutoGUI FAILSAFE must be active")
+
+        # Failsafe simulation on scroll
+        with patch("pyautogui.scroll", side_effect=pyautogui.FailSafeException()):
+            res = mouse_scroll(clicks=2)
+            self.assertFalse(res.get("success"))
+            self.assertTrue(res.get("interrupted_by_failsafe"))
+            self.assertIn("failsafe", res.get("error", "").lower())
+
+        # Failsafe simulation on click
+        with patch("pyautogui.click", side_effect=pyautogui.FailSafeException()):
+            res = mouse_click(x=200, y=200)
+            self.assertFalse(res.get("success"))
+            self.assertTrue(res.get("interrupted_by_failsafe"))
+            self.assertIn("failsafe", res.get("error", "").lower())
 
 
 if __name__ == "__main__":
