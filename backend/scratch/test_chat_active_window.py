@@ -6,8 +6,10 @@ sys.path.insert(0, "backend")
 os.environ["LAPTOP_AI_TEST_MODE"] = "1"
 
 from app.main import app
+from app.core.security import get_test_session_token
 
 def main():
+    token = get_test_session_token()
     with TestClient(app) as client:
         payload = {
             "message": "Identify my currently active Windows application. Return its window title, process name, PID, HWND, dimensions, and minimized status.",
@@ -16,7 +18,11 @@ def main():
         }
 
         print("Sending /api/chat request...")
-        response = client.post("/api/chat", json=payload, headers={"origin": "http://127.0.0.1:5173"})
+        response = client.post(
+            "/api/chat",
+            json=payload,
+            headers={"origin": "http://127.0.0.1:5173", "X-Session-Token": token}
+        )
         print("Status code:", response.status_code)
         data = response.json()
         print("\n=== ASSISTANT REPLY ===")

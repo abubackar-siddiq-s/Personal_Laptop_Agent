@@ -25,53 +25,189 @@ from app.core.conversation_intelligence import (
     get_project_context,
 )
 
+ALLOWED_ORIGINS = {
+    "http://127.0.0.1:5173",
+    "http://localhost:5173",
+    "http://127.0.0.1:8000",
+    "http://localhost:8000",
+}
+
+ALLOWED_HOSTS = {
+    "127.0.0.1",
+    "localhost",
+    "127.0.0.1:8000",
+    "localhost:8000",
+    "testclient",
+    "testserver",
+}
+
+
 def verify_local_origin(request: Request):
-    """Enforce strict access control: Loopback client only, local origin, and session authorization."""
+    """
+    Enforce strict access control:
+    1. Host header validation to prevent DNS rebinding attacks.
+    2. Loopback client IP only.
+    3. Exact scheme, hostname, and port matching on Origin.
+    4. Referer and Sec-Fetch-Site checks to prevent CSRF and cross-origin state changes.
+    5. Real session token validation on ALL mutating routes (no testclient bypass).
+    """
+    # 1. Host header validation
+    host = request.headers.get("host", "").lower().strip()
+    if host:
+        host_without_port = host.split(":")[0]
+        if host_without_port not in ("127.0.0.1", "localhost", "testclient", "testserver"):
+            raise HTTPException(
+                400,
+                f"Host Header Security Violation: Untrusted host header '{host}'. Access blocked.",
+            )
+
+    # 2. Loopback client verification
     client_host = request.client.host if request.client else ""
     if client_host not in ("127.0.0.1", "::1", "localhost", "testclient"):
         raise HTTPException(
             403,
             f"Security Violation: Remote access from host '{client_host}' is blocked.",
         )
+
+    # 3. Exact Origin header validation (Exact scheme, hostname, and port)
     origin = request.headers.get("origin")
     if origin:
-        allowed = ("http://127.0.0.1:5173", "http://localhost:5173", "http://127.0.0.1:8000", "http://localhost:8000")
-        if not any(origin.startswith(a) for a in allowed):
-            raise HTTPException(403, f"Security Violation: Cross-origin request from '{origin}' is forbidden.")
+        if origin not in ALLOWED_ORIGINS:
+            raise HTTPException(
+                403,
+                f"Security Violation: Cross-origin request from '{origin}' is forbidden. Expected local frontend origin.",
+            )
 
-    # Session token validation for state-modifying requests
+    # 4. Sec-Fetch-Site & Referer validation
+    sec_fetch_site = request.headers.get("sec-fetch-site")
+    if sec_fetch_site == "cross-site":
+        if not origin or origin not in ALLOWED_ORIGINS:
+            raise HTTPException(
+                403,
+                "Security Violation: Cross-site request rejected.",
+            )
+
+    referer = request.headers.get("referer")
+    if referer and not origin:
+        is_allowed_referer = any(referer.startswith(o) for o in ALLOWED_ORIGINS)
+        if not is_allowed_referer:
+            raise HTTPException(
+                403,
+                f"Security Violation: Cross-origin referer '{referer}' is forbidden.",
+            )
+
+    # 5. Session token validation for all state-modifying requests (POST, PUT, DELETE, PATCH)
     path = request.url.path
     if request.method in ("POST", "PUT", "DELETE", "PATCH"):
-        if not path.endswith("/auth/session") and not path.endswith("/emergency/stop"):
-            token = (
-                request.headers.get("X-Session-Token")
-                or request.cookies.get("laptop_ai_session")
-                or request.headers.get("authorization", "").replace("Bearer ", "").strip()
+        # Universal emergency stop is always permitted as a safety override
+        if path.endswith("/emergency/stop"):
+            return
+        # Bootstrap authentication endpoint validates bootstrap secret separately
+        if path.endswith("/auth/session"):
+            return
+
+        token = (
+            request.headers.get("X-Session-Token")
+            or request.cookies.get("laptop_ai_session")
+            or request.headers.get("authorization", "").replace("Bearer ", "").strip()
+        )
+        from app.core.security import validate_session_token
+        # Strict enforcement: NO testclient bypass!
+        if not validate_session_token(token):
+            raise HTTPException(
+                401,
+                "Session Security Violation: Missing, invalid, expired, or revoked local session token. Authenticate via POST /api/auth/session.",
             )
-            from app.core.security import validate_session_token
-            if client_host != "testclient" and not validate_session_token(token):
-                raise HTTPException(
-                    401,
-                    "Session Security Violation: Missing or invalid local session token. Call /api/auth/session to initialize session.",
-                )
 
 
 r = APIRouter(dependencies=[Depends(verify_local_origin)])
 
 
-@r.get("/auth/session")
-def get_auth_session(response: Response):
-    """Provide session-bound authorization token for legitimate local clients."""
-    from app.core.security import get_or_create_session_token
-    token = get_or_create_session_token()
+class SessionAuthReq(BaseModel):
+    bootstrap_token: str = Field(..., description="Cryptographic bootstrap secret")
+
+
+@r.post("/auth/session")
+def authenticate_session(req: SessionAuthReq, response: Response):
+    """
+    Authenticate using local bootstrap secret and issue an active session token.
+    Enforces bootstrap authorization before issuing a session token.
+    """
+    from app.core.security import validate_bootstrap_token, create_session_token
+    if not validate_bootstrap_token(req.bootstrap_token):
+        raise HTTPException(
+            401,
+            "Bootstrap Security Violation: Invalid or unauthorized bootstrap credential.",
+        )
+    session = create_session_token(ttl_seconds=86400, client_info="authenticated_session")
     response.set_cookie(
         key="laptop_ai_session",
-        value=token,
+        value=session.token,
         httponly=True,
         samesite="strict",
         secure=False,
     )
-    return {"session_token": token, "status": "active"}
+    return {
+        "session_token": session.token,
+        "expires_at": session.expires_at,
+        "status": "active",
+    }
+
+
+@r.post("/auth/rotate")
+def rotate_session(request: Request, response: Response):
+    """Rotate active session token. Invalidates old token and issues a new active token."""
+    token = (
+        request.headers.get("X-Session-Token")
+        or request.cookies.get("laptop_ai_session")
+        or request.headers.get("authorization", "").replace("Bearer ", "").strip()
+    )
+    from app.core.security import rotate_session_token
+    new_session = rotate_session_token(token)
+    if not new_session:
+        raise HTTPException(
+            401,
+            "Session Security Violation: Cannot rotate invalid, expired, or revoked session.",
+        )
+    response.set_cookie(
+        key="laptop_ai_session",
+        value=new_session.token,
+        httponly=True,
+        samesite="strict",
+        secure=False,
+    )
+    return {
+        "session_token": new_session.token,
+        "expires_at": new_session.expires_at,
+        "status": "active",
+    }
+
+
+@r.post("/auth/revoke")
+def revoke_session(request: Request, response: Response):
+    """Explicitly revoke active session token."""
+    token = (
+        request.headers.get("X-Session-Token")
+        or request.cookies.get("laptop_ai_session")
+        or request.headers.get("authorization", "").replace("Bearer ", "").strip()
+    )
+    from app.core.security import revoke_session_token
+    revoked = revoke_session_token(token)
+    response.delete_cookie(key="laptop_ai_session")
+    return {"status": "revoked" if revoked else "not_found"}
+
+
+@r.get("/auth/session")
+def get_session_status(request: Request):
+    """Check whether the client possesses an active, valid session without leaking tokens."""
+    token = (
+        request.headers.get("X-Session-Token")
+        or request.cookies.get("laptop_ai_session")
+        or request.headers.get("authorization", "").replace("Bearer ", "").strip()
+    )
+    from app.core.security import validate_session_token
+    is_valid = validate_session_token(token)
+    return {"authenticated": is_valid, "status": "active" if is_valid else "unauthenticated"}
 
 
 class Chat(BaseModel):

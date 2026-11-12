@@ -339,8 +339,44 @@ class AgentEngine:
 
         # Permission check: If risk level is not 'read', it requires user approval
         if spec.risk != "read":
-            appr = ApprovalLifecycle.create_request(reg_name, args, risk=spec.risk, conversation_id=conversation_id)
+            import hashlib
+            clean_args = json.dumps(args, sort_keys=True, default=str)
+            tc_id = getattr(tool_call, "id", None) or "call"
+            op_id = f"op_{conversation_id}_{tc_id}_{reg_name}_{hashlib.sha256(clean_args.encode()).hexdigest()[:16]}"
+            appr = ApprovalLifecycle.create_request(
+                reg_name,
+                args,
+                risk=spec.risk,
+                conversation_id=conversation_id,
+                operation_id=op_id,
+            )
             aid = appr["id"]
+
+            if appr.get("reused"):
+                rec = ToolExecutionRecord(
+                    tool_name=reg_name,
+                    arguments=args,
+                    success=True,
+                    result=appr.get("result"),
+                    approval_id=aid,
+                )
+                return appr.get("result"), rec
+            elif appr.get("uncertain_recovery"):
+                rec = ToolExecutionRecord(
+                    tool_name=reg_name,
+                    arguments=args,
+                    success=False,
+                    error=appr.get("error", "Uncertain operation state after crash; manual review required"),
+                    approval_id=aid,
+                )
+                return {
+                    "status": "manual_review_required",
+                    "approval_id": aid,
+                    "tool_name": reg_name,
+                    "error": appr.get("error"),
+                    "message": "Operation state is uncertain due to previous server termination. Potentially destructive action was not automatically rerun. Manual review required.",
+                }, rec
+
             rec = ToolExecutionRecord(
                 tool_name=reg_name,
                 arguments=args,

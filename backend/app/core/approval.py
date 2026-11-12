@@ -80,8 +80,13 @@ class ApprovalLifecycle:
         risk: str = "approval",
         ttl_seconds: int = DEFAULT_TTL_SECONDS,
         conversation_id: int | None = None,
+        operation_id: str | None = None,
     ) -> dict:
-        """Create a new pending approval record bound to exact tool name, hashed arguments, and originating conversation."""
+        """
+        Create a durable approval record bound to exact tool name, hashed arguments,
+        originating conversation, and durable operation_id.
+        Prevents duplicate requests and enables completed operation result reuse.
+        """
         clean_args_str = canonical_json(args)
         args_hash = hashlib.sha256(clean_args_str.encode("utf-8")).hexdigest()
         token = uuid.uuid4().hex
@@ -90,17 +95,76 @@ class ApprovalLifecycle:
         created_at = now.isoformat()
 
         with conn() as c:
+            # Check for existing durable operation ID to prevent duplicate actions
+            if operation_id:
+                cls._expire_stale(c)
+                existing = c.execute("SELECT * FROM approvals WHERE operation_id=?", (operation_id,)).fetchone()
+                if existing:
+                    ex_dict = dict(existing)
+                    # Completed-operation result reuse
+                    if ex_dict["status"] == "executed":
+                        parsed_res = None
+                        if ex_dict.get("result"):
+                            try:
+                                parsed_res = json.loads(ex_dict["result"])
+                            except Exception:
+                                parsed_res = ex_dict["result"]
+                        return {
+                            "id": ex_dict["id"],
+                            "approval_token": ex_dict["approval_token"],
+                            "tool_name": ex_dict["tool_name"],
+                            "args": args,
+                            "status": "executed",
+                            "risk": ex_dict.get("risk", risk),
+                            "created_at": ex_dict["created_at"],
+                            "expires_at": ex_dict.get("expires_at"),
+                            "conversation_id": ex_dict.get("conversation_id"),
+                            "operation_id": operation_id,
+                            "result": parsed_res,
+                            "reused": True,
+                        }
+                    # If already pending or executing, avoid duplicate queues
+                    elif ex_dict["status"] in ("pending", "executing"):
+                        return {
+                            "id": ex_dict["id"],
+                            "approval_token": ex_dict["approval_token"],
+                            "tool_name": ex_dict["tool_name"],
+                            "args": args,
+                            "status": ex_dict["status"],
+                            "risk": ex_dict.get("risk", risk),
+                            "created_at": ex_dict["created_at"],
+                            "expires_at": ex_dict.get("expires_at"),
+                            "conversation_id": ex_dict.get("conversation_id"),
+                            "operation_id": operation_id,
+                            "deduplicated": True,
+                        }
+                    # If failed / interrupted, do NOT blindly recreate or repeat
+                    elif ex_dict["status"] == "failed":
+                        return {
+                            "id": ex_dict["id"],
+                            "approval_token": ex_dict["approval_token"],
+                            "tool_name": ex_dict["tool_name"],
+                            "args": args,
+                            "status": "failed",
+                            "risk": ex_dict.get("risk", risk),
+                            "created_at": ex_dict["created_at"],
+                            "error": ex_dict.get("error"),
+                            "conversation_id": ex_dict.get("conversation_id"),
+                            "operation_id": operation_id,
+                            "uncertain_recovery": True,
+                        }
+
             cursor = c.execute(
                 """
                 INSERT INTO approvals(
-                    tool_name, args, status, created_at, approval_token, args_hash, risk, expires_at, conversation_id
-                ) VALUES (?, ?, 'pending', ?, ?, ?, ?, ?, ?)
+                    tool_name, args, status, created_at, approval_token, args_hash, risk, expires_at, conversation_id, operation_id
+                ) VALUES (?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (tool_name, clean_args_str, created_at, token, args_hash, risk, expires_at, conversation_id),
+                (tool_name, clean_args_str, created_at, token, args_hash, risk, expires_at, conversation_id, operation_id),
             )
             aid = cursor.lastrowid
 
-        audit("approval.created", f"ID {aid}: {tool_name} (token: {token[:8]}...) conv_id={conversation_id}")
+        audit("approval.created", f"ID {aid}: {tool_name} (token: {token[:8]}...) conv_id={conversation_id} op_id={operation_id}")
         return {
             "id": aid,
             "approval_token": token,
@@ -111,6 +175,7 @@ class ApprovalLifecycle:
             "created_at": created_at,
             "expires_at": expires_at,
             "conversation_id": conversation_id,
+            "operation_id": operation_id,
         }
 
     @classmethod

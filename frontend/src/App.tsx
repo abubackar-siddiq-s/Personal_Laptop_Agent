@@ -189,18 +189,42 @@ export default function App() {
   const [newPrefCat, setNewPrefCat] = useState('preferences');
 
   let [localSessionToken, setLocalSessionToken] = useState<string>('');
+  let [bootstrapRequired, setBootstrapRequired] = useState<boolean>(false);
+  let [manualBootstrapKey, setManualBootstrapKey] = useState<string>('');
 
   async function ensureSession(): Promise<string> {
     if (localSessionToken) return localSessionToken;
     try {
-      let r = await fetch(API + '/auth/session');
-      if (r.ok) {
-        let d = await r.json();
-        let tok = d.session_token || '';
-        setLocalSessionToken(tok);
-        return tok;
+      // 1. Try reading bootstrap token from local Vite static file
+      let bToken = '';
+      try {
+        let bRes = await fetch('/bootstrap.json');
+        if (bRes.ok) {
+          let bData = await bRes.json();
+          bToken = bData.bootstrap_token || '';
+        }
+      } catch (_) {}
+
+      if (!bToken && manualBootstrapKey) {
+        bToken = manualBootstrapKey.trim();
+      }
+
+      if (bToken) {
+        let r = await fetch(API + '/auth/session', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ bootstrap_token: bToken }),
+        });
+        if (r.ok) {
+          let d = await r.json();
+          let tok = d.session_token || '';
+          setLocalSessionToken(tok);
+          setBootstrapRequired(false);
+          return tok;
+        }
       }
     } catch (_) {}
+    setBootstrapRequired(true);
     return '';
   }
 
@@ -215,6 +239,10 @@ export default function App() {
       ...(init?.headers as Record<string, string> || {}),
     };
     let r = await fetch(API+path,{...init, headers});
+    if (r.status === 401 && !path.startsWith('/auth/session')) {
+      setLocalSessionToken('');
+      setBootstrapRequired(true);
+    }
     let d = await r.json();
     if(!r.ok) throw Error(d.detail||'Request failed');
     return d;
@@ -1492,6 +1520,28 @@ export default function App() {
                 <button className="ghost" onClick={() => setShowStopModal(false)}>Cancel</button>
                 <button className="danger-btn" onClick={triggerEmergency}>Confirm Emergency Stop</button>
               </div>
+            </div>
+          </div>
+        )}
+
+        {bootstrapRequired && !localSessionToken && (
+          <div style={{background:'#1e1528',border:'1px solid #7c3aed',borderRadius:8,padding:'12px 16px',margin:'10px 20px',display:'flex',alignItems:'center',justifyContent:'space-between',gap:12}}>
+            <div style={{display:'flex',alignItems:'center',gap:10}}>
+              <ShieldCheck size={20} color="#a855f7"/>
+              <div>
+                <b style={{color:'#e9d5ff',fontSize:13}}>Session Authorization Required</b>
+                <div style={{color:'#c084fc',fontSize:11}}>Enter local bootstrap secret from <code>%USERPROFILE%\.laptop_ai\bootstrap.token</code> to authorize this browser session.</div>
+              </div>
+            </div>
+            <div style={{display:'flex',gap:8}}>
+              <input
+                type="password"
+                placeholder="Paste 64-char bootstrap key"
+                value={manualBootstrapKey}
+                onChange={e=>setManualBootstrapKey(e.target.value)}
+                style={{background:'#0f0c1b',border:'1px solid #581c87',borderRadius:6,padding:'6px 10px',color:'#fff',fontSize:12,width:260}}
+              />
+              <button className="primary" onClick={()=>ensureSession()} style={{padding:'6px 14px',fontSize:12}}>Authorize</button>
             </div>
           </div>
         )}

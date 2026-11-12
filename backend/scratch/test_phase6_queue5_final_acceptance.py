@@ -67,19 +67,58 @@ class TestPhase6Queue5FinalIntegrationAndSecurity(unittest.TestCase):
     # 1. LOCAL API & SESSION SECURITY
     # -------------------------------------------------------------
     def test_01_local_session_token_lifecycle(self):
-        """Verify generation, constant-time validation, and rejection of invalid session tokens."""
-        token = get_or_create_session_token()
-        self.assertIsInstance(token, str)
-        self.assertEqual(len(token), 64)  # 32 bytes hex = 64 chars
+        """Verify bootstrap secret, session generation, rotation, expiration, and revocation."""
+        from app.core.security import (
+            get_or_create_bootstrap_secret,
+            validate_bootstrap_token,
+            create_session_token,
+            validate_session_token,
+            rotate_session_token,
+            revoke_session_token,
+        )
+        from starlette.testclient import TestClient
+        from app.main import app
 
-        # Valid token passes
+        # 1. Bootstrap secret
+        b_secret = get_or_create_bootstrap_secret()
+        self.assertIsInstance(b_secret, str)
+        self.assertEqual(len(b_secret), 64)
+        self.assertTrue(validate_bootstrap_token(b_secret))
+        self.assertFalse(validate_bootstrap_token("wrong_secret_12345"))
+
+        # 2. Session creation and constant-time validation
+        session = create_session_token(ttl_seconds=3600, client_info="acceptance_test")
+        token = session.token
+        self.assertEqual(len(token), 64)
         self.assertTrue(validate_session_token(token))
-
-        # Tampered or empty tokens fail
         self.assertFalse(validate_session_token(""))
         self.assertFalse(validate_session_token(None))
-        self.assertFalse(validate_session_token("invalid_token_12345"))
         self.assertFalse(validate_session_token(token[:-1] + ("0" if token[-1] != "0" else "1")))
+
+        # 3. Expiration
+        exp_session = create_session_token(ttl_seconds=-5, client_info="expired_acceptance")
+        self.assertFalse(validate_session_token(exp_session.token))
+
+        # 4. Rotation
+        rot_session = rotate_session_token(token)
+        self.assertIsNotNone(rot_session)
+        self.assertNotEqual(token, rot_session.token)
+        self.assertFalse(validate_session_token(token))  # Old token revoked
+        self.assertTrue(validate_session_token(rot_session.token))  # New token valid
+
+        # 5. Revocation
+        self.assertTrue(revoke_session_token(rot_session.token))
+        self.assertFalse(validate_session_token(rot_session.token))
+
+        # 6. HTTP level enforcement (without testclient bypass)
+        client = TestClient(app, base_url="http://127.0.0.1:8000")
+        # Without token -> 401
+        res_no_tok = client.post("/api/settings", json={"theme": "dark"}, headers={"origin": "http://127.0.0.1:5173"})
+        self.assertEqual(res_no_tok.status_code, 401)
+        # With valid token -> 200
+        valid_sess = create_session_token(ttl_seconds=3600)
+        res_tok = client.post("/api/settings", json={"theme": "dark"}, headers={"origin": "http://127.0.0.1:5173", "X-Session-Token": valid_sess.token})
+        self.assertEqual(res_tok.status_code, 200)
 
     def test_02_sensitive_credential_redaction_in_audit(self):
         """Verify API keys and bearer tokens are automatically redacted before database persistence."""

@@ -1,6 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.core.db import init_db
+from app.core.security import get_or_create_bootstrap_secret
 from app.core.approval import ApprovalLifecycle
 from app.planner import task_executor, task_scheduler
 from app.tools.native import register
@@ -25,6 +26,7 @@ app.include_router(r, prefix="/api")
 @app.on_event("startup")
 async def start():
     init_db()
+    get_or_create_bootstrap_secret()
     ApprovalLifecycle.recover_interrupted_executions()
     task_executor.recover_interrupted_tasks()
     task_scheduler.recover_interrupted_schedules()

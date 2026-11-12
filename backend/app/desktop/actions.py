@@ -173,6 +173,15 @@ def mouse_scroll(
         sw, sh = get_screen_dimensions()
         if 0 <= x <= sw and 0 <= y <= sh:
             pyautogui.moveTo(x, y)
+    else:
+        # Check if cursor is parked in failsafe corner (0, 0)
+        try:
+            cur_pos = pyautogui.position()
+            if cur_pos[0] == 0 and cur_pos[1] == 0:
+                sw, sh = get_screen_dimensions()
+                pyautogui.moveTo(sw // 2, sh // 2)
+        except Exception:
+            pass
 
     amount = clicks * 120
     try:

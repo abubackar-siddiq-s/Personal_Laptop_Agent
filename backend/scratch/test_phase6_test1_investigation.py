@@ -107,13 +107,19 @@ class TestPhase6Test1Investigation(unittest.TestCase):
     # 5. End-to-end chat invocation
     def test_05_end_to_end_chat_invocation(self):
         """Verify /api/chat invokes desktop.window.active and returns actual Windows telemetry."""
+        from app.core.security import get_test_session_token
+        session_token = get_test_session_token()
         with TestClient(app) as client:
             payload = {
                 "message": "Identify my currently active Windows application. Return its window title, process name, PID, HWND, dimensions, and minimized status.",
                 "provider": "openrouter",
                 "model": "openrouter/auto"
             }
-            res = client.post("/api/chat", json=payload, headers={"origin": "http://127.0.0.1:5173"})
+            res = client.post(
+                "/api/chat",
+                json=payload,
+                headers={"origin": "http://127.0.0.1:5173", "X-Session-Token": session_token},
+            )
             self.assertEqual(res.status_code, 200)
             data = res.json()
             reply = data.get("reply", "")

@@ -52,9 +52,15 @@ def init_db():
             executed_at TEXT,
             result TEXT,
             error TEXT,
-            conversation_id INTEGER
+            conversation_id INTEGER,
+            operation_id TEXT
         );
         """)
+        try:
+            c.execute("ALTER TABLE approvals ADD COLUMN operation_id TEXT;")
+        except Exception:
+            pass
+        c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_approvals_op_id ON approvals(operation_id) WHERE operation_id IS NOT NULL;")
         c.execute("""
         CREATE TABLE IF NOT EXISTS audit(
             id INTEGER PRIMARY KEY,

@@ -179,11 +179,22 @@ class TestPhase6Queue1Desktop(unittest.TestCase):
         self.assertFalse(res2.get("success"))
         self.assertIn("outside", res2.get("error", "").lower())
 
-        # Valid scroll notches bounds
-        res3 = mouse_scroll(clicks=5, direction="invalid_dir")
-        self.assertTrue(res3.get("success"))
-        self.assertEqual(res3["direction"], "down")  # normalized
+        # Valid scroll notches bounds (with backend isolated for pure argument validation)
+        with patch("pyautogui.scroll") as mock_scroll, patch("pyautogui.moveTo"):
+            res3 = mouse_scroll(clicks=5, direction="invalid_dir")
+            self.assertTrue(res3.get("success"))
+            self.assertEqual(res3["direction"], "down")  # normalized
+            mock_scroll.assert_called_once_with(-600)
         print(" [PASS] 07. Mouse action argument validation verified.")
+
+    def test_07b_mouse_failsafe_handling(self):
+        """Verify PyAutoGUI corner fail-safe triggers are safely caught without crashing."""
+        import pyautogui
+        with patch("pyautogui.scroll", side_effect=pyautogui.FailSafeException()):
+            res = mouse_scroll(clicks=3)
+            self.assertFalse(res.get("success"))
+            self.assertIn("failsafeexception", res.get("error", "").lower())
+        print(" [PASS] 07b. Corner fail-safe exception safely handled.")
 
     # -------------------------------------------------------------
     # 8. Keyboard Shortcut Allowlisting

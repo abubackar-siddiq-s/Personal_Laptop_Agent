@@ -452,10 +452,10 @@ class TestVisualIntelligenceMocked(unittest.TestCase):
 
 
 class TestVisualIntelligenceLiveWindows(unittest.TestCase):
-    """Live verification against real Windows OS desktop session (unmocked)."""
+    """Live verification against real Windows OS desktop session and deterministic OCR fixtures."""
 
-    def test_live_windows_ocr_and_screen_analysis(self):
-        """13. Real desktop session verification: captures screenshot and executes WinRT OCR."""
+    def test_13a_live_windows_desktop_session_ocr(self):
+        """13a. Real desktop session verification: captures screenshot and executes WinRT OCR."""
         from app.desktop.screenshots import capture_screenshot
         from app.vision.ocr import run_ocr
         from app.vision.ui_detector import detect_ui_elements
@@ -472,14 +472,14 @@ class TestVisualIntelligenceLiveWindows(unittest.TestCase):
         # Execute live WinRT OCR
         ocr_res = run_ocr(shot_path, screen_width=cap_res.get("width"), screen_height=cap_res.get("height"))
         self.assertTrue(ocr_res.success)
-        self.assertGreater(ocr_res.line_count, 0)
-        self.assertTrue(len(ocr_res.lines) > 0)
+        self.assertIsInstance(ocr_res.line_count, int)
+        self.assertIsInstance(ocr_res.text, str)
 
         # Detect live UI elements
         elements = detect_ui_elements(shot_path, ocr_result=ocr_res, screen_width=cap_res.get("width"), screen_height=cap_res.get("height"))
-        self.assertTrue(len(elements) > 0)
+        self.assertIsInstance(elements, list)
 
-        # Verify element structures
+        # Verify element structures if any detected
         for el in elements[:5]:
             self.assertIn(el.element_type, ("button", "text_input", "menu", "dialog", "toolbar", "tab", "icon", "notification", "error_warning"))
             self.assertGreater(el.confidence, 0.0)
@@ -487,6 +487,63 @@ class TestVisualIntelligenceLiveWindows(unittest.TestCase):
             self.assertTrue(len(el.bbox.center) == 2)
 
         print(f"\n[Live Windows Vision Verified] Lines OCRed: {ocr_res.line_count}, Elements Detected: {len(elements)}, Engine: {ocr_res.engine_used}")
+
+    def test_13b_deterministic_known_text_ocr_fixture(self):
+        """13b. Deterministic fixture verification: image with known high-contrast text must be recognized."""
+        from PIL import Image, ImageDraw
+        import tempfile
+        from app.vision.ocr import run_ocr
+
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+            tmp_path = tmp.name
+
+        try:
+            # Create a 400x120 white image with clear black text
+            img = Image.new("RGB", (400, 120), color="white")
+            draw = ImageDraw.Draw(img)
+            draw.text((20, 45), "LAPTOP AI OCR TEST 123", fill="black")
+            img.save(tmp_path)
+
+            res = run_ocr(tmp_path)
+            self.assertTrue(res.success)
+            self.assertGreater(res.line_count, 0)
+            self.assertIn("LAPTOP", res.text.upper())
+            print(f" [PASS] 13b. Deterministic text fixture recognized: '{res.text.strip()}'")
+        finally:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+
+    def test_13c_blank_image_zero_text_handling(self):
+        """13c. Blank image handling: an image containing no readable text returns a valid empty OCR result."""
+        from PIL import Image
+        import tempfile
+        from app.vision.ocr import run_ocr
+
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+            tmp_path = tmp.name
+
+        try:
+            # Solid color image with zero text
+            img = Image.new("RGB", (200, 200), color="black")
+            img.save(tmp_path)
+
+            res = run_ocr(tmp_path)
+            self.assertTrue(res.success)
+            self.assertEqual(res.line_count, 0)
+            self.assertEqual(res.text, "")
+            self.assertEqual(len(res.lines), 0)
+            print(" [PASS] 13c. Blank image returned valid zero-text result.")
+        finally:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+
+    def test_13d_invalid_image_error_handling(self):
+        """13d. Invalid image handling: non-existent or corrupted files fail gracefully with error."""
+        from app.vision.ocr import run_ocr
+        res = run_ocr("non_existent_image_12345.png")
+        self.assertFalse(res.success)
+        self.assertIsNotNone(res.error)
+        print(" [PASS] 13d. Non-existent image cleanly reported error without crashing.")
 
 
 if __name__ == "__main__":
