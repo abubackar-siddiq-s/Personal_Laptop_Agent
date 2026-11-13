@@ -505,11 +505,14 @@ class CredentialManager:
         Returns (credential_id, decrypted_key) or None if no keys eligible.
         
         Selection order:
-        1. User-selected primary key (if not excluded and not in cooldown)
-        2. Other enabled keys ordered by priority ASC, consecutive_failures ASC
+        1. User-selected primary key (if not excluded, enabled, valid, and not in cooldown)
+        2. Other enabled keys ordered by priority ASC, consecutive_failures ASC, last_used_at ASC
         3. Excludes keys in active cooldown or marked 'invalid'
         4. Excludes keys matching rate-limited quota scopes
-        5. Falls back to environment variable if no DB keys are configured
+        5. Falls back to environment variable ONLY if:
+           - No database credentials are configured for this provider (Case A), OR
+           - Environment fallback has an explicitly established, independent quota scope that is not in cooldown (Case D),
+             AND does NOT match a disabled or invalid credential (Case E).
         """
         p = provider.lower().strip()
         now = datetime.now(timezone.utc)
@@ -517,41 +520,44 @@ class CredentialManager:
         exclude = set(exclude_ids or [])
 
         with conn() as c:
-            # 1. Check active quota scope cooldowns
-            cooldown_scopes = set()
-            scope_rows = c.execute(
+            # 1. Check all configured credentials for this provider
+            all_rows = c.execute(
                 """
-                SELECT DISTINCT quota_scope FROM provider_credentials
-                WHERE provider=? AND quota_scope IS NOT NULL AND cooldown_until > ?
-                """,
-                (p, now_iso),
-            ).fetchall()
-            for r in scope_rows:
-                if r["quota_scope"]:
-                    cooldown_scopes.add(r["quota_scope"])
-
-            # 2. Query candidates
-            rows = c.execute(
-                """
-                SELECT id, encrypted_key, is_primary, priority, consecutive_failures,
-                       cooldown_until, quota_scope, status
+                SELECT id, key_fingerprint, encrypted_key, is_primary, priority, enabled,
+                       status, consecutive_failures, cooldown_until, quota_scope
                 FROM provider_credentials
-                WHERE provider=? AND enabled=1 AND status != 'invalid'
+                WHERE provider=?
                 ORDER BY is_primary DESC, priority ASC, consecutive_failures ASC, last_used_at ASC
                 """,
                 (p,),
             ).fetchall()
 
-            for row in rows:
+            total_configured = len(all_rows)
+
+            # 2. Check active quota scope cooldowns
+            cooldown_scopes = set()
+            for r in all_rows:
+                q_scope = r["quota_scope"]
+                cd = r["cooldown_until"]
+                if q_scope and cd and cd > now_iso:
+                    cooldown_scopes.add(q_scope)
+
+            # 3. Filter eligible database candidates
+            for row in all_rows:
                 cid = row["id"]
+                # Must be enabled
+                if not row["enabled"]:
+                    continue
+                # Must not be invalid
+                if row["status"] == "invalid":
+                    continue
+                # Must not be excluded
                 if cid in exclude:
                     continue
-
                 # Check key-level cooldown
                 cd = row["cooldown_until"]
                 if cd and cd > now_iso:
                     continue
-
                 # Check shared quota scope cooldown
                 q_scope = row["quota_scope"]
                 if q_scope and q_scope in cooldown_scopes:
@@ -570,16 +576,98 @@ class CredentialManager:
                     )
                     continue
 
-        # 3. Environment variable fallback compatibility
-        if "env_fallback" not in exclude:
-            env_key = {
-                "gemini": settings.gemini_api_key,
-                "groq": settings.groq_api_key,
-                "openrouter": settings.openrouter_api_key,
-            }.get(p, "")
-            clean_env = env_key.strip("'\" \t\r\n")
-            if clean_env:
-                return ("env_fallback", clean_env)
+            # 4. Environment variable fallback evaluation
+            if "env_fallback" not in exclude:
+                env_key = {
+                    "gemini": settings.gemini_api_key,
+                    "groq": settings.groq_api_key,
+                    "openrouter": settings.openrouter_api_key,
+                }.get(p, "")
+                clean_env = env_key.strip("'\" \t\r\n")
+
+                if clean_env:
+                    env_fp = compute_fingerprint(clean_env)
+
+                    # Check if the .env key is registered in the database vault
+                    matching_db_cred = next((r for r in all_rows if r["key_fingerprint"] == env_fp), None)
+
+                    if matching_db_cred:
+                        # Case E: Preserves intentional user configuration.
+                        # If the credential was disabled or marked invalid in DB, NEVER use it as env_fallback.
+                        if not matching_db_cred["enabled"]:
+                            logger.info("Env fallback key for %s matches disabled credential '%s'; suppressing.", p, matching_db_cred["id"])
+                            return None
+                        if matching_db_cred["status"] == "invalid":
+                            logger.info("Env fallback key for %s matches invalid credential '%s'; suppressing.", p, matching_db_cred["id"])
+                            return None
+
+                        # Case C: Check if it is in key-level cooldown or shared quota scope cooldown
+                        cd = matching_db_cred["cooldown_until"]
+                        if cd and cd > now_iso:
+                            return None
+                        q_scope = matching_db_cred["quota_scope"]
+                        if q_scope and q_scope in cooldown_scopes:
+                            return None
+
+                        # If matching_db_cred was excluded (already attempted in this turn)
+                        if matching_db_cred["id"] in exclude:
+                            return None
+
+                        # If it is enabled, valid, not in cooldown, and not excluded, it can be returned
+                        try:
+                            decrypted = decrypt_secret(matching_db_cred["encrypted_key"])
+                            return (matching_db_cred["id"], decrypted)
+                        except Exception:
+                            return None
+
+                    # If .env key is NOT registered in database:
+                    if total_configured == 0:
+                        # Case A: No database credentials configured at all -> safe to use .env
+                        return ("env_fallback", clean_env)
+
+                    # Case D & Case C: Database credentials ARE configured, but .env key is not in DB.
+                    # Do NOT assume different key means independent quota!
+                    # Check if an explicit independent quota scope was configured in environment:
+                    env_scope_var = f"{p.upper()}_QUOTA_SCOPE"
+                    env_scope = os.environ.get(env_scope_var, "").strip()
+
+                    # Check if all database credentials are intentionally disabled (Case E)
+                    all_disabled = total_configured > 0 and all(not r["enabled"] for r in all_rows)
+                    if all_disabled:
+                        logger.info("All database credentials for %s are disabled; suppressing env fallback.", p)
+                        return None
+
+                    # Check if all database credentials are invalid (Case E)
+                    all_invalid = total_configured > 0 and all(r["status"] == "invalid" for r in all_rows)
+                    if all_invalid:
+                        logger.info("All database credentials for %s are invalid; suppressing env fallback.", p)
+                        return None
+
+                    # Check if any enabled database credentials are in cooldown or shared scope in cooldown (Case C)
+                    all_enabled_in_cooldown = all(
+                        (r["cooldown_until"] and r["cooldown_until"] > now_iso) or
+                        (r["quota_scope"] and r["quota_scope"] in cooldown_scopes)
+                        for r in all_rows if r["enabled"] and r["status"] != "invalid"
+                    ) if any(r["enabled"] and r["status"] != "invalid" for r in all_rows) else False
+
+                    # If all DB credentials share an exhausted scope or are in cooldown:
+                    if len(cooldown_scopes) > 0 or all_enabled_in_cooldown:
+                        if not env_scope or env_scope in cooldown_scopes:
+                            logger.info(
+                                "All database credentials for %s are exhausted/cooldown and env key has no independent verified scope; suppressing env fallback.",
+                                p
+                            )
+                            return None
+                        else:
+                            # Explicitly established independent scope that is NOT in cooldown_scopes (Case D)
+                            return ("env_fallback", clean_env)
+
+                    # If no cooldowns exist on DB keys, but all DB keys were excluded or none eligible:
+                    if not env_scope and total_configured > 0:
+                        # Database is the primary vault; unmanaged .env key without explicit scope is suppressed
+                        return None
+
+                    return ("env_fallback", clean_env)
 
         return None
 

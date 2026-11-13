@@ -1,5 +1,6 @@
 from __future__ import annotations
 import asyncio
+from datetime import datetime, timezone
 import time
 import json
 import logging
@@ -143,6 +144,20 @@ async def chat_turn(
             cred_selection = CredentialManager.get_eligible_credential(p, exclude_ids=tried_credential_ids)
             if not cred_selection:
                 if not tried_credential_ids:
+                    prov_creds = CredentialManager.list_credentials(p)
+                    if prov_creds:
+                        now_iso = datetime.now(timezone.utc).isoformat()
+                        has_cooldown = any(
+                            (c.get("cooldown_until") and c["cooldown_until"] > now_iso) or c.get("status") == "cooldown"
+                            for c in prov_creds
+                        )
+                        if has_cooldown:
+                            raise RateLimitError(
+                                provider=p,
+                                model=model,
+                                wait_seconds=30.0,
+                                message=f"All configured credentials for {provider.capitalize()} are temporarily in cooldown.",
+                            )
                     raise RuntimeError(f"{provider.capitalize()} API key is not configured in backend/.env or credential store.")
                 break
 

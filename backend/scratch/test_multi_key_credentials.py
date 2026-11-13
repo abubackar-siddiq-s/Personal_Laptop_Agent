@@ -464,6 +464,129 @@ class TestMultiKeyCredentials(unittest.TestCase):
         self.assertIn("summary", data["metrics"])
         self.assertIn("providers", data["metrics"])
 
+    # =========================================================================
+    # 8. Regression Suite — Quota Scopes & Fallback Boundary Tests (Cases A - E)
+    # =========================================================================
+
+    def test_25_case_1_no_db_credentials_env_fallback_works(self):
+        """Case A: When no database credentials exist, environment fallback works."""
+        with conn() as c:
+            c.execute("DELETE FROM provider_credentials WHERE provider='groq'")
+
+        with patch("app.core.config.settings.groq_api_key", "gsk_env_fallback_test_key_12345"):
+            res = CredentialManager.get_eligible_credential("groq")
+            self.assertIsNotNone(res)
+            self.assertEqual(res[0], "env_fallback")
+            self.assertEqual(res[1], "gsk_env_fallback_test_key_12345")
+
+    def test_26_case_2_db_primary_available_primary_selected(self):
+        """Case B: When database credentials are available, the primary key is selected over .env."""
+        c1 = CredentialManager.add_credential("gemini", "TEST_Gem_Pri_1", "AIza_pri_key_111111111", priority=10, is_primary=True)
+        with patch("app.core.config.settings.gemini_api_key", "AIza_env_key_222222222"):
+            res = CredentialManager.get_eligible_credential("gemini")
+            self.assertIsNotNone(res)
+            self.assertEqual(res[0], c1["id"])
+            self.assertEqual(res[1], "AIza_pri_key_111111111")
+
+    def test_27_case_3_primary_in_cooldown_independent_backup_selected(self):
+        """Primary in cooldown; independent backup key is selected without calling .env."""
+        c1 = CredentialManager.add_credential("openrouter", "TEST_OR_Pri", "sk-or-v1-pri_1111111", priority=10, is_primary=True, quota_scope="account-a")
+        c2 = CredentialManager.add_credential("openrouter", "TEST_OR_Bkp", "sk-or-v1-bkp_2222222", priority=20, is_primary=False, quota_scope="account-b")
+
+        # Put c1 into cooldown
+        CredentialManager.record_failure(c1["id"], error_code="429", error_message="Free tier account limit", cooldown_seconds=60, quota_scope="account-a")
+
+        with patch("app.core.config.settings.openrouter_api_key", "sk-or-v1-env_3333333"):
+            res = CredentialManager.get_eligible_credential("openrouter")
+            self.assertIsNotNone(res)
+            self.assertEqual(res[0], c2["id"])
+            self.assertEqual(res[1], "sk-or-v1-bkp_2222222")
+
+    def test_28_case_4_all_db_keys_same_exhausted_scope_env_suppressed(self):
+        """Case C: All database keys share an exhausted scope; .env fallback is strictly suppressed."""
+        c1 = CredentialManager.add_credential("groq", "TEST_Groq_Org_1", "gsk_test_org_1111111", priority=10, is_primary=True, quota_scope="org-acme")
+        c2 = CredentialManager.add_credential("groq", "TEST_Groq_Org_2", "gsk_test_org_2222222", priority=20, is_primary=False, quota_scope="org-acme")
+
+        # Org rate limit 429
+        CredentialManager.record_failure(c1["id"], error_code="429", error_message="Organization TPM rate limit exceeded", cooldown_seconds=60, quota_scope="org-acme")
+
+        # Even with groq_api_key set in .env, fallback must be suppressed
+        with patch("app.core.config.settings.groq_api_key", "gsk_test_org_1111111"):
+            res = CredentialManager.get_eligible_credential("groq")
+            self.assertIsNone(res)
+
+    def test_29_case_5_env_fallback_independent_scope_eligible(self):
+        """Case D: Environment fallback with an explicitly established independent scope is eligible."""
+        c1 = CredentialManager.add_credential("gemini", "TEST_Gem_Proj_1", "AIza_proj1_11111111", priority=10, is_primary=True, quota_scope="project-exhausted")
+        CredentialManager.record_failure(c1["id"], error_code="429", error_message="Project limit reached", cooldown_seconds=60, quota_scope="project-exhausted")
+
+        # Explicitly configure independent scope in environment
+        with patch("app.core.config.settings.gemini_api_key", "AIza_independent_paid_key_999"), \
+             patch.dict(os.environ, {"GEMINI_QUOTA_SCOPE": "project-independent-paid"}):
+            res = CredentialManager.get_eligible_credential("gemini")
+            self.assertIsNotNone(res)
+            self.assertEqual(res[0], "env_fallback")
+            self.assertEqual(res[1], "AIza_independent_paid_key_999")
+
+    def test_30_case_6_all_db_keys_disabled_no_accidental_fallback(self):
+        """Case E: When all database credentials are intentionally disabled, no fallback to disabled key."""
+        c1 = CredentialManager.add_credential("groq", "TEST_Groq_Dis_1", "gsk_disabled_key_11111", priority=10, is_primary=True)
+        CredentialManager.disable_credential(c1["id"])
+
+        # .env has the same key that user disabled
+        with patch("app.core.config.settings.groq_api_key", "gsk_disabled_key_11111"):
+            res = CredentialManager.get_eligible_credential("groq")
+            self.assertIsNone(res)
+
+    def test_31_case_7_all_db_keys_invalid_no_accidental_reuse(self):
+        """Case E: When database credential is marked invalid (401), .env key with same fingerprint is NOT reused."""
+        c1 = CredentialManager.add_credential("openrouter", "TEST_OR_Inv_1", "sk-or-v1-invalid_key_401", priority=10, is_primary=True)
+        CredentialManager.record_failure(c1["id"], error_code="401", is_auth_failure=True, error_message="Unauthorized")
+
+        with patch("app.core.config.settings.openrouter_api_key", "sk-or-v1-invalid_key_401"):
+            res = CredentialManager.get_eligible_credential("openrouter")
+            self.assertIsNone(res)
+
+    def test_32_case_8_cooldown_expiry_selectable_again(self):
+        """Key becomes selectable again immediately after cooldown timestamp expires."""
+        c1 = CredentialManager.add_credential("groq", "TEST_Groq_Exp_1", "gsk_expired_cd_key_111", priority=10, is_primary=True)
+        # Set cooldown in the past (10 seconds ago)
+        past_iso = "2020-01-01T00:00:00+00:00"
+        with conn() as c:
+            c.execute("UPDATE provider_credentials SET cooldown_until = ?, status = 'cooldown' WHERE id = ?", (past_iso, c1["id"]))
+
+        res = CredentialManager.get_eligible_credential("groq")
+        self.assertIsNotNone(res)
+        self.assertEqual(res[0], c1["id"])
+
+    def test_33_case_9_no_eligible_credentials_triggers_provider_fallback(self):
+        """When all credentials for Groq are in cooldown, router raises RateLimitError triggering fallback."""
+        c1 = CredentialManager.add_credential("groq", "TEST_Groq_AllCD", "gsk_all_cd_key_111", priority=10, is_primary=True, quota_scope="org-acme")
+        CredentialManager.record_failure(c1["id"], error_code="429", error_message="Organization TPM rate limit exceeded", cooldown_seconds=60, quota_scope="org-acme")
+
+        # Must raise RateLimitError without calling .env
+        with patch("app.core.config.settings.groq_api_key", "gsk_all_cd_key_111"):
+            with self.assertRaises(RateLimitError):
+                asyncio.run(chat_turn("groq", "openai/gpt-oss-20b", [{"role": "user", "content": "hello"}]))
+
+    def test_34_case_10_concurrent_selection_consistent_state(self):
+        """Concurrent selection calls execute safely without race conditions or database lock errors."""
+        c1 = CredentialManager.add_credential("groq", "TEST_Groq_Conc_1", "gsk_concurrent_key_1", priority=10, is_primary=True)
+        c2 = CredentialManager.add_credential("gemini", "TEST_Gem_Conc_1", "AIza_concurrent_key_1", priority=10, is_primary=True)
+
+        async def worker():
+            res1 = CredentialManager.get_eligible_credential("groq")
+            res2 = CredentialManager.get_eligible_credential("gemini")
+            return res1[0] == c1["id"] and res2[0] == c2["id"]
+
+        async def run_concurrent():
+            tasks = [worker() for _ in range(20)]
+            results = await asyncio.gather(*tasks)
+            return all(results)
+
+        all_ok = asyncio.run(run_concurrent())
+        self.assertTrue(all_ok)
+
 
 if __name__ == "__main__":
     unittest.main()
