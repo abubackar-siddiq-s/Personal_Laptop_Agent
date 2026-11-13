@@ -130,6 +130,8 @@ async def run_acceptance():
     print("\n[CRITERION 5] Conversation summaries preserve important decisions...")
     conv_id = 99991
     with conn() as c:
+        c.execute("DELETE FROM memories WHERE conversation_id = ? OR key LIKE ?", (conv_id, f"%{conv_id}%"))
+        c.execute("DELETE FROM messages WHERE conversation_id = ?", (conv_id,))
         c.execute("INSERT OR REPLACE INTO conversations(id, title) VALUES (?, 'Phase 5 Decision Conv')", (conv_id,))
         for i in range(8):
             role = "user" if i % 2 == 0 else "assistant"

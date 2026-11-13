@@ -471,7 +471,7 @@ class TestPhase7InferenceOrchestration(unittest.TestCase):
         c = TestClient(app)
         b_token = get_or_create_bootstrap_secret()
         auth_res = c.post("/api/auth/session", json={"bootstrap_token": b_token})
-        sess_token = auth_res.json()["session_token"]
+        sess_token = auth_res.cookies.get("laptop_ai_session")
 
         res = c.post(
             "/api/chat",

@@ -13,26 +13,32 @@ const API = 'http://127.0.0.1:8000/api';
 type Tool = {name:string;description:string;source:string;risk:string};
 type Msg = {role:string;content:string;queue_request_id?:string};
 
-const nav = [
-  ['Overview',LayoutDashboard],
-  ['Assistant',Sparkles],
-  ['Chat',MessageSquare],
-  ['Desktop',Monitor],
-  ['Visual AI',Eye],
-  ['Files',Folder],
-  ['Tasks',Workflow],
-  ['Memory',Brain],
-  ['Browser',Globe],
-  ['Tool Registry',Boxes],
-  ['Models',Bot],
-  ['Activity Log',Clock3],
-  ['Settings',Settings],
-  ['System',Activity],
-  ['Terminal',Terminal]
+const personalNav = [
+  ['Overview', LayoutDashboard, 'Command center & day at a glance'],
+  ['Chat', MessageSquare, 'Primary conversation & agent workspace'],
+  ['Desktop Assistant', Monitor, 'Screen vision, windows & proactive assistance'],
+  ['Files', Folder, 'Search, document analysis, spreadsheets & duplicates'],
+  ['Browser', Globe, 'Automated web navigation & inspection'],
+  ['Tasks and Reminders', Workflow, 'Multi-step plans, schedules & personal reminders'],
+  ['Memory', Brain, 'Personal preferences, facts & learned context'],
+  ['Activity', Clock3, 'Pending approvals & tool audit log'],
+];
+
+const advancedNav = [
+  ['Models & Credentials', Bot],
+  ['Tool Registry & MCP', Boxes],
+  ['System & Safety', Activity],
 ];
 
 export default function App() {
   const [page,P] = useState('Overview');
+  const [daTab, setDaTab] = useState<'proactive' | 'desktop' | 'vision'>('proactive');
+  const [trTab, setTrTab] = useState<'plans' | 'schedules' | 'reminders'>('plans');
+  const [actTab, setActTab] = useState<'approvals' | 'audit'>('approvals');
+  const [advTab, setAdvTab] = useState<'models' | 'tools' | 'system'>('models');
+  const [overviewPrompt, setOverviewPrompt] = useState<string>('');
+  const [backendConnecting, setBackendConnecting] = useState<boolean>(true);
+  const [conversationsList, setConversationsList] = useState<any[]>([]);
   const [tools,T] = useState<Tool[]>([]);
   const [servers,S] = useState<any[]>([]);
   const [providers,V] = useState<any>({});
@@ -77,7 +83,7 @@ export default function App() {
   // Phase 5 State: Emergency, Memory, Tasks, Scheduler
   const [emergency, setEmergency] = useState<any>({ is_stopped: false, reason: '', stopped_at: '' });
   const [showStopModal, setShowStopModal] = useState<boolean>(false);
-  const [tasksTab, setTasksTab] = useState<'plans' | 'schedules'>('plans');
+  const [tasksTab, setTasksTab] = useState<'plans' | 'schedules' | 'reminders'>('plans');
 
   // Memories
   const [memories, setMemories] = useState<any[]>([]);
@@ -190,13 +196,7 @@ export default function App() {
   const [newPrefVal, setNewPrefVal] = useState('');
   const [newPrefCat, setNewPrefCat] = useState('preferences');
 
-  let [localSessionToken, setLocalSessionToken] = useState<string>(() => {
-    try {
-      return sessionStorage.getItem('laptop_ai_session_token') || '';
-    } catch {
-      return '';
-    }
-  });
+  let [isAuthenticated, setIsAuthenticated] = useState<boolean>(false);
   let [bootstrapRequired, setBootstrapRequired] = useState<boolean>(false);
   let [manualBootstrapKey, setManualBootstrapKey] = useState<string>('');
   let [authError, setAuthError] = useState<string>('');
@@ -218,96 +218,72 @@ export default function App() {
   const [credTestResults, setCredTestResults] = useState<Record<string, any>>({});
   const [filterCredProvider, setFilterCredProvider] = useState<string>('all');
 
-  async function authorizeWithKey(keyToTry?: string): Promise<string> {
+  async function authorizeWithKey(keyToTry?: string): Promise<boolean> {
     setAuthError('');
     let bToken = (keyToTry !== undefined ? keyToTry : manualBootstrapKey || '').trim();
     if (!bToken) {
-      try {
-        bToken = sessionStorage.getItem('laptop_ai_bootstrap_token') || '';
-      } catch {}
-    }
-    if (!bToken) {
       setBootstrapRequired(true);
-      return '';
+      return false;
     }
     try {
       let r = await fetch(API + '/auth/session', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Requested-With': 'LAPTOP_AI',
+        },
         body: JSON.stringify({ bootstrap_token: bToken }),
       });
       if (r.ok) {
-        let d = await r.json();
-        let tok = d.session_token || '';
-        setLocalSessionToken(tok);
+        setIsAuthenticated(true);
         setBootstrapRequired(false);
-        try {
-          sessionStorage.setItem('laptop_ai_session_token', tok);
-          sessionStorage.setItem('laptop_ai_bootstrap_token', bToken);
-        } catch {}
-        return tok;
+        setManualBootstrapKey('');
+        await refresh();
+        return true;
       } else {
         let errData = await r.json().catch(() => ({}));
         let msg = errData.detail || 'Authorization failed: Invalid bootstrap token.';
         setAuthError(msg);
         setBootstrapRequired(true);
-        try {
-          sessionStorage.removeItem('laptop_ai_session_token');
-        } catch {}
+        setIsAuthenticated(false);
       }
     } catch (err: any) {
       setAuthError('Connection error: could not reach authentication backend.');
       setBootstrapRequired(true);
     }
-    return '';
-  }
-
-  async function ensureSession(): Promise<string> {
-    if (localSessionToken) return localSessionToken;
-    try {
-      let cached = sessionStorage.getItem('laptop_ai_session_token');
-      if (cached) {
-        setLocalSessionToken(cached);
-        return cached;
-      }
-    } catch {}
-    return await authorizeWithKey();
+    return false;
   }
 
   async function revokeSession() {
     try {
-      if (localSessionToken) {
-        await fetch(API + '/auth/revoke', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'X-Session-Token': localSessionToken,
-          },
-        });
-      }
+      await fetch(API + '/auth/revoke', {
+        method: 'POST',
+        credentials: 'include',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Requested-With': 'LAPTOP_AI',
+        },
+      });
     } catch {}
-    try {
-      sessionStorage.removeItem('laptop_ai_session_token');
-      sessionStorage.removeItem('laptop_ai_bootstrap_token');
-    } catch {}
-    setLocalSessionToken('');
+    setIsAuthenticated(false);
     setBootstrapRequired(true);
     Z('Session locked / revoked. Re-authorization required.');
   }
 
   async function req(path:string,init?:RequestInit) {
-    let token = localSessionToken;
-    if (!token && !path.startsWith('/auth/session')) {
-      token = await ensureSession();
-    }
     let headers: Record<string, string> = {
       'Content-Type': 'application/json',
-      ...(token ? { 'X-Session-Token': token } : {}),
+      'X-Requested-With': 'LAPTOP_AI',
       ...(init?.headers as Record<string, string> || {}),
     };
-    let r = await fetch(API+path,{...init, headers});
-    if (r.status === 401 && !path.startsWith('/auth/session')) {
-      setLocalSessionToken('');
+    let r = await fetch(API+path,{
+      ...init,
+      credentials: 'include',
+      headers,
+    });
+    if (r.status === 401 && !path.startsWith('/auth/session') && !path.startsWith('/auth/setup')) {
+      setIsAuthenticated(false);
       setBootstrapRequired(true);
     }
     let d = await r.json();
@@ -315,15 +291,47 @@ export default function App() {
     return d;
   }
 
-  async function refresh() {
+  async function triggerChatPrompt(promptText: string) {
+    if (!promptText.trim()) return;
+    P('Chat');
+    let m = promptText.trim();
+    M(x => [...x, { role: 'user', content: m }]);
+    B(true);
+    setInfStatus(`Sending request to ${provider.toUpperCase()} (${model})...`);
     try {
-      let[t,s,v,a,q,y,stg,emg,credsRes,healthRes,ccRes] = await Promise.all([
+      let d = await req('/chat', {
+        method: 'POST',
+        body: JSON.stringify({ message: m, conversation_id: cid, provider, model }),
+      });
+      C(d.conversation_id);
+      M(x => [...x, { role: 'assistant', content: d.reply }]);
+      if (d.fallback_occurred) {
+        setInfStatus(`Notice: Switched to ${d.provider_used.toUpperCase()} fallback due to rate limits.`);
+        Z(`Rate limit reached on ${d.fallback_from}; successfully completed with ${d.provider_used} fallback.`);
+      } else {
+        setInfStatus('');
+      }
+      refresh();
+    } catch (e: any) {
+      M(x => [...x, { role: 'assistant', content: `Execution error: ${e.message}` }]);
+      Z(`Execution error: ${e.message}`);
+    } finally {
+      B(false);
+    }
+  }
+
+  async function refresh() {
+    if (bootstrapRequired && !isAuthenticated) return;
+    try {
+      let[t,s,v,a,q,y,stg,emg,credsRes,healthRes,ccRes,convRes] = await Promise.all([
         req('/tools'),req('/mcp/servers'),req('/providers'),req('/audit'),req('/approvals'),req('/system'),req('/settings'),req('/emergency/status'),
         req('/providers/credentials').catch(()=>({credentials:[]})),
         req('/providers/credentials/health').catch(()=>({metrics:{}})),
-        req('/inference/control-center').catch(()=>null)
+        req('/inference/control-center').catch(()=>null),
+        req('/conversations').catch(()=>[])
       ]);
       T(t);S(s);V(v);A(a);Q(q);Y(y);
+      if (Array.isArray(convRes)) setConversationsList(convRes);
       if (credsRes?.credentials) setCredentials(credsRes.credentials);
       if (healthRes?.metrics) setCredHealth(healthRes.metrics);
       if (ccRes) setControlCenter(ccRes);
@@ -1429,13 +1437,112 @@ export default function App() {
     }
   }
 
+  // Initial one-time connection and auth handshake
+  useEffect(() => {
+    let isMounted = true;
+
+    async function initHandshake() {
+      // 1. Health check poll to eliminate NetworkError race condition on startup
+      let healthy = false;
+      let attempts = 0;
+      while (!healthy && attempts < 10 && isMounted) {
+        attempts++;
+        try {
+          let hRes = await fetch(API + '/health', { credentials: 'include' });
+          if (hRes.ok) {
+            healthy = true;
+            if (isMounted) setBackendConnecting(false);
+            break;
+          }
+        } catch (_) {
+          // Backend initializing
+        }
+        await new Promise(r => setTimeout(r, 400));
+      }
+
+      if (!healthy) {
+        if (isMounted) {
+          setBackendConnecting(false);
+          setAuthError('Unable to reach LAPTOP AI backend at http://127.0.0.1:8000.');
+        }
+        return;
+      }
+
+      // 2. Consume one-time setup ticket from URL if present
+      try {
+        let params = new URLSearchParams(window.location.search);
+        let ticket = params.get('setup_ticket');
+        if (ticket) {
+          window.history.replaceState({}, document.title, window.location.pathname);
+          let sRes = await fetch(API + '/auth/setup', {
+            method: 'POST',
+            credentials: 'include',
+            headers: {
+              'Content-Type': 'application/json',
+              'X-Requested-With': 'LAPTOP_AI',
+            },
+            body: JSON.stringify({ setup_ticket: ticket.trim() }),
+          });
+          if (sRes.ok) {
+            if (isMounted) {
+              setIsAuthenticated(true);
+              setBootstrapRequired(false);
+            }
+            await refresh();
+            return;
+          }
+        }
+      } catch (_) {}
+
+      // 3. Verify existing session with GET /api/auth/session (browser sends HttpOnly cookie automatically)
+      let sessionActive = false;
+      try {
+        let authCheck = await fetch(API + '/auth/session', {
+          method: 'GET',
+          credentials: 'include',
+        });
+        if (authCheck.ok) {
+          let checkData = await authCheck.json();
+          if (checkData.authenticated) {
+            sessionActive = true;
+            if (isMounted) {
+              setIsAuthenticated(true);
+              setBootstrapRequired(false);
+            }
+          }
+        }
+      } catch (_) {}
+
+      if (!sessionActive) {
+        if (isMounted) {
+          setIsAuthenticated(false);
+          setBootstrapRequired(true);
+        }
+      } else {
+        await refresh();
+      }
+    }
+
+    initHandshake();
+
+    return () => {
+      isMounted = false;
+    };
+  }, []);
+
   useEffect(() => {
     refresh();
     if (page === 'Files') {
       loadIndexStatusAction();
     }
-    if (page === 'Assistant') {
+    if (page === 'Desktop Assistant' || page === 'Assistant') {
       loadAssistantData();
+      loadDesktopData();
+      loadVisionData();
+    }
+    if (page === 'Tasks and Reminders' || page === 'Tasks') {
+      loadTasks();
+      loadSchedules();
     }
     let i = setInterval(refresh, 10000);
     return () => clearInterval(i);
@@ -1729,40 +1836,71 @@ export default function App() {
           <div><b>LAPTOP <em>AI</em></b><small>PERSONAL INTELLIGENCE</small></div>
         </div>
         <div className="workspace">
-          <div className="avatar">A</div>
-          <div><b>Personal Workspace</b><small>Local environment</small></div>
+          <div className="avatar">P</div>
+          <div><b>Personal Workspace</b><small>Windows 10 ThinkPad</small></div>
         </div>
         <div className="search">
-          <Search size={14}/><span>Search navigation</span><kbd>⌘ K</kbd>
+          <Search size={14}/><span>Personal Workspace</span><kbd>LOCAL</kbd>
         </div>
-        <div className="navlabel">WORKSPACE</div>
-        {nav.slice(0,3).map(([n,I]:any)=>(
-          <button key={n} className={'nav '+(page===n?'selected':'')} onClick={()=>P(n)}>
-            <I size={17}/>{n}
-            {n==='Assistant'&&asUnreadCount>0&&<small className="notif-badge">{asUnreadCount}</small>}
-          </button>
-        ))}
-        <div className="navlabel">CONTROL CENTER</div>
-        {nav.slice(3,7).map(([n,I]:any)=>(
-          <button key={n} className={'nav '+(page===n?'selected':'')} onClick={()=>P(n)}>
-            <I size={17}/>{n}
-          </button>
-        ))}
-        <div className="navlabel">PREFERENCES & TOOLS</div>
-        {nav.slice(7).map(([n,I]:any)=>(
-          <button key={n} className={'nav '+(page===n?'selected':'')} onClick={()=>P(n)}>
-            <I size={17}/>{n}{n==='Tool Registry'&&<small className="count">{tools.length}</small>}
-          </button>
-        ))}
+        <div className="navlabel">PERSONAL WORKSPACE</div>
+        {personalNav.map(([n, I, desc]: any) => {
+          let badge: any = null;
+          if (n === 'Desktop Assistant' && asUnreadCount > 0) badge = asUnreadCount;
+          else if (n === 'Activity' && approvals.filter((a: any) => a.status === 'pending').length > 0)
+            badge = approvals.filter((a: any) => a.status === 'pending').length;
+          else if (n === 'Tasks and Reminders' && asReminders.filter((r: any) => r.status === 'pending').length > 0)
+            badge = asReminders.filter((r: any) => r.status === 'pending').length;
+
+          let isSelected =
+            page === n ||
+            (n === 'Desktop Assistant' && (page === 'Desktop' || page === 'Visual AI' || page === 'Assistant')) ||
+            (n === 'Tasks and Reminders' && page === 'Tasks') ||
+            (n === 'Activity' && page === 'Activity Log');
+
+          return (
+            <button
+              key={n}
+              className={'nav ' + (isSelected ? 'selected' : '')}
+              onClick={() => P(n)}
+              title={desc}
+            >
+              <I size={17} />
+              <span>{n}</span>
+              {badge !== null && <small className="notif-badge">{badge}</small>}
+            </button>
+          );
+        })}
+
+        <div className="navlabel">SYSTEM & ADVANCED</div>
+        {advancedNav.map(([n, I]: any) => {
+          let isSelected =
+            page === n ||
+            (n === 'Models & Credentials' && (page === 'Models' || page === 'Settings')) ||
+            (n === 'Tool Registry & MCP' && page === 'Tool Registry') ||
+            (n === 'System & Safety' && page === 'System');
+
+          return (
+            <button
+              key={n}
+              className={'nav ' + (isSelected ? 'selected' : '')}
+              onClick={() => P(n)}
+            >
+              <I size={16} />
+              <span>{n}</span>
+              {n === 'Tool Registry & MCP' && <small className="count">{tools.length}</small>}
+            </button>
+          );
+        })}
+
         <div className="sidebottom">
           <div className="runtime">
-            <span>LOCAL AGENT</span><b><i/> ONLINE</b>
-            <strong>Workspace ready</strong>
-            <small>{tools.length} tools · {servers.length} MCP servers</small>
+            <span>LOCAL ENGINE</span><b><i/> ONLINE</b>
+            <strong>ThinkPad Core i5</strong>
+            <small>{tools.length} local tools · Cloud Inference</small>
           </div>
           <div className="user">
-            <div className="avatar">A</div>
-            <div><b>Administrator</b><small>Local user</small></div>
+            <div className="avatar">P</div>
+            <div><b>Personal Owner</b><small>Single-User Windows 10</small></div>
           </div>
         </div>
       </aside>
@@ -1780,8 +1918,8 @@ export default function App() {
                 <StopCircle size={14} /> Emergency Stop
               </button>
             )}
-            <span className="online"><i/> Local engine</span>
-            {localSessionToken ? (
+            <span className="online"><i/> Local ThinkPad Engine</span>
+            {isAuthenticated ? (
               <button
                 className="ghost"
                 onClick={revokeSession}
@@ -1791,12 +1929,15 @@ export default function App() {
                 <Lock size={13} /> Lock
               </button>
             ) : null}
-            <button className="ghost" onClick={() => { P('Assistant'); setAsTab('notifications'); }} title="Notifications">
+            <button
+              className="ghost"
+              onClick={() => { P('Desktop Assistant'); setDaTab('proactive'); setAsTab('notifications'); }}
+              title="Notifications"
+            >
               <Bell size={16}/>
               {asUnreadCount > 0 && <span className="notif-badge">{asUnreadCount}</span>}
             </button>
-            <button className="ghost" onClick={refresh}><RefreshCw size={16}/></button>
-            <CircleHelp size={17}/>
+            <button className="ghost" onClick={refresh} title="Refresh workspace"><RefreshCw size={16}/></button>
           </div>
         </header>
 
@@ -1977,28 +2118,44 @@ export default function App() {
           </div>
         )}
 
-        {bootstrapRequired && !localSessionToken && (
-          <div style={{background:'#1e1528',border:'1px solid #7c3aed',borderRadius:8,padding:'12px 16px',margin:'10px 20px',display:'flex',alignItems:'center',justifyContent:'space-between',gap:12}}>
-            <div style={{display:'flex',alignItems:'center',gap:10}}>
-              <ShieldCheck size={20} color="#a855f7"/>
-              <div>
-                <b style={{color:'#e9d5ff',fontSize:13}}>Local Authorization Required</b>
-                <div style={{color:'#c084fc',fontSize:11}}>
-                  Enter local bootstrap secret from <code>%USERPROFILE%\.laptop_ai\bootstrap.token</code> (or <code>LAPTOP_AI_BOOTSTRAP_SECRET</code>) to authorize this browser session.
-                </div>
-                {authError && <div style={{color:'#f87171',fontSize:11,marginTop:4,fontWeight:500}}>{authError}</div>}
+        {bootstrapRequired && !isAuthenticated && (
+          <div className="setup-card-overlay">
+            <div className="setup-card">
+              <h2><ShieldCheck size={26} color="#a855f7" /> One-Time Personal Setup</h2>
+              <p>
+                Welcome to <strong>LAPTOP AI</strong>. This assistant runs exclusively on your personal Windows laptop.
+                Authorize this browser once with your local bootstrap secret to activate a <strong>30-day persistent session</strong>.
+                You will not be asked for keys or tokens on future launches.
+              </p>
+              <div style={{background:'#0c1017',border:'1px solid #2a3547',borderRadius:8,padding:'12px',marginBottom:16,fontSize:11,color:'#94a3b8'}}>
+                <span style={{color:'#a855f7',fontWeight:600}}>Credential Location:</span><br/>
+                <code>%USERPROFILE%\.laptop_ai\bootstrap.token</code>
               </div>
-            </div>
-            <div style={{display:'flex',gap:8}}>
-              <input
-                type="password"
-                placeholder="Paste bootstrap secret..."
-                value={manualBootstrapKey}
-                onChange={e=>setManualBootstrapKey(e.target.value)}
-                onKeyDown={e=>{ if (e.key === 'Enter') authorizeWithKey(manualBootstrapKey); }}
-                style={{background:'#0f0c1b',border:'1px solid #581c87',borderRadius:6,padding:'6px 10px',color:'#fff',fontSize:12,width:260}}
-              />
-              <button className="primary" onClick={()=>authorizeWithKey(manualBootstrapKey)} style={{padding:'6px 14px',fontSize:12}}>Authorize</button>
+              {authError && (
+                <div style={{background:'rgba(239,68,68,0.15)',border:'1px solid #ef4444',borderRadius:6,padding:'8px 12px',color:'#fca5a5',fontSize:11,marginBottom:14}}>
+                  {authError}
+                </div>
+              )}
+              <div style={{display:'flex',gap:10}}>
+                <input
+                  type="password"
+                  placeholder="Paste local bootstrap secret..."
+                  value={manualBootstrapKey}
+                  onChange={e => setManualBootstrapKey(e.target.value)}
+                  onKeyDown={e => { if (e.key === 'Enter') authorizeWithKey(manualBootstrapKey); }}
+                  style={{flex:1,background:'#0a0e16',border:'1px solid #4338ca',borderRadius:6,padding:'10px 14px',color:'#fff',fontSize:12}}
+                />
+                <button
+                  className="primary"
+                  onClick={() => authorizeWithKey(manualBootstrapKey)}
+                  style={{padding:'10px 18px',fontSize:12,fontWeight:700}}
+                >
+                  Authorize 30 Days
+                </button>
+              </div>
+              <small style={{display:'block',color:'#64748b',fontSize:10,marginTop:12,textAlign:'center'}}>
+                Tip: You can also launch via <code>start.bat</code> to automatically authenticate via a single-use ticket.
+              </small>
             </div>
           </div>
         )}
@@ -2006,46 +2163,324 @@ export default function App() {
         {notice&&<div className="notice">{notice}<button onClick={()=>Z('')}><X size={14}/></button></div>}
 
         <section className="content">
-          {page==='Overview'&&<>
-            <Heading tag="YOUR COMMAND CENTER" title="Good to see you." desc="Your personal AI workspace, connected to your machine and the tools you choose." action={<button className="primary" onClick={()=>P('Chat')}><Plus size={15}/> New conversation</button>}/>
-            <div className="hero">
-              <div className="hero-text">
-                <span><Sparkles size={13}/> PERSONAL AI · READY</span>
-                <h1>Make your computer<br/><em>work for you.</em></h1>
-                <p>One intelligent workspace to think, build, automate and get things done — with you in control.</p>
-                <button className="primary" onClick={()=>P('Chat')}>Start a conversation <ArrowUpRight size={15}/></button>
+          {page==='Overview' && (
+            <>
+              <Heading
+                tag="PERSONAL COMMAND CENTER"
+                title="Good to see you."
+                desc="Your personal agentic AI workspace — configured once, ready every day on your Windows ThinkPad."
+                action={
+                  <div style={{display:'flex',gap:8}}>
+                    <button className="primary" onClick={() => P('Chat')}>
+                      <MessageSquare size={14} /> Open Chat
+                    </button>
+                    <button className="secondary" onClick={() => { P('Desktop Assistant'); setDaTab('proactive'); }}>
+                      <Sparkles size={14} /> Daily Briefing
+                    </button>
+                  </div>
+                }
+              />
+
+              {/* Natural Language Task Input Box */}
+              <div className="personal-prompt-box">
+                <div style={{display:'flex',justifyContent:'space-between',alignItems:'center'}}>
+                  <span style={{fontSize:11,fontWeight:700,letterSpacing:1,color:'#818cf8',display:'flex',alignItems:'center',gap:6}}>
+                    <Sparkles size={14} /> WHAT WOULD YOU LIKE TO ACCOMPLISH?
+                  </span>
+                  <span style={{fontSize:10,color:'#94a3b8'}}>
+                    Provider: <strong style={{color:'#34d399'}}>{provider.toUpperCase()}</strong> · Fallback: <strong style={{color:'#60a5fa'}}>ACTIVE</strong>
+                  </span>
+                </div>
+                <div className="personal-prompt-input-row">
+                  <input
+                    className="personal-prompt-input"
+                    placeholder="Ask a question, start a research task, inspect open windows, organize files..."
+                    value={overviewPrompt}
+                    onChange={e => setOverviewPrompt(e.target.value)}
+                    onKeyDown={e => {
+                      if (e.key === 'Enter' && overviewPrompt.trim()) {
+                        let p = overviewPrompt;
+                        setOverviewPrompt('');
+                        triggerChatPrompt(p);
+                      }
+                    }}
+                  />
+                  <button
+                    className="primary"
+                    disabled={!overviewPrompt.trim()}
+                    onClick={() => {
+                      let p = overviewPrompt;
+                      setOverviewPrompt('');
+                      triggerChatPrompt(p);
+                    }}
+                    style={{padding:'10px 18px',fontSize:12}}
+                  >
+                    <Send size={14} /> Run
+                  </button>
+                </div>
+                {/* Natural language task shortcuts across all workspaces */}
+                <div className="prompt-pills-row">
+                  <button className="prompt-pill" onClick={() => triggerChatPrompt('Give me a quick briefing on my daily schedule, pending tasks, and system status')}>
+                    <Calendar size={12} /> Daily briefing & tasks
+                  </button>
+                  <button className="prompt-pill" onClick={() => triggerChatPrompt('Inspect active windows on my desktop and describe what application is currently open')}>
+                    <Monitor size={12} /> Inspect desktop windows
+                  </button>
+                  <button className="prompt-pill" onClick={() => triggerChatPrompt('Analyze my Downloads directory and find any duplicate or large files wasting disk space')}>
+                    <Folder size={12} /> Scan Downloads for duplicates
+                  </button>
+                  <button className="prompt-pill" onClick={() => triggerChatPrompt('Open the browser and summarize the top technology news headlines for today')}>
+                    <Globe size={12} /> Browse tech headlines
+                  </button>
+                  <button className="prompt-pill" onClick={() => triggerChatPrompt('Check my upcoming reminders and tell me if any items are overdue')}>
+                    <Bell size={12} /> Check reminders
+                  </button>
+                </div>
               </div>
-              <div className="orb"><div className="core"><Sparkles size={35}/></div><i/><b/><small/></div>
-              <footer><span>● Local runtime active</span><span>PRIVATE BY DESIGN</span></footer>
-            </div>
-            <div className="stats">
-              <Stat icon={Boxes} label="Registered tools" value={tools.length} note="Native + MCP + Browser"/>
-              <Stat icon={Plug} label="MCP connections" value={servers.length} note="External tool servers"/>
-              <Stat icon={ShieldCheck} label="Pending approvals" value={approvals.filter((a:any)=>a.status==='pending').length} note="Awaiting review"/>
-              <Stat icon={Cpu} label="Memory usage" value={system.memory_percent?system.memory_percent+'%':'—'} note={system.memory_total_gb?system.memory_total_gb+' GB installed RAM':'System telemetry'}/>
-            </div>
-            <div className="sectiontitle">
-              <div><b>Workspace overview</b><small>Live status from your local environment</small></div>
-              <span className="live">● LIVE</span>
-            </div>
-            <div className="lower">
-              <div className="panel">
-                <h3>System performance</h3>
-                <small>Your machine at a glance</small>
-                <Meter label="CPU utilization" val={system.cpu_percent}/>
-                <Meter label="Memory utilization" val={system.memory_percent}/>
-                <Meter label="Storage utilization" val={system.disk_percent}/>
+
+              {/* 4-Card Personal Productivity Grid */}
+              <div className="overview-four-grid">
+                {/* 1. Pending Approvals */}
+                <div className="overview-widget-card">
+                  <div className="overview-widget-header">
+                    <b>
+                      <ShieldCheck size={16} color="#f59e0b" />
+                      Pending Approvals ({approvals.filter((a: any) => a.status === 'pending').length})
+                    </b>
+                    <button onClick={() => { P('Activity'); setActTab('approvals'); }}>
+                      View all <ChevronRight size={13} />
+                    </button>
+                  </div>
+                  <div className="overview-widget-body">
+                    {approvals.filter((a: any) => a.status === 'pending').length === 0 ? (
+                      <div style={{color:'#64748b',fontSize:11,display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',height:'100%',textAlign:'center',padding:'20px 0'}}>
+                        <CheckCircle size={28} color="#10b981" style={{marginBottom:8,opacity:0.8}} />
+                        <span>No actions requiring approval. Safe execution active.</span>
+                      </div>
+                    ) : (
+                      approvals.filter((a: any) => a.status === 'pending').map((a: any) => (
+                        <div key={a.id} className="overview-item-row">
+                          <div style={{flex:1,minWidth:0,marginRight:8}}>
+                            <div style={{fontWeight:600,color:'#f1f5f9',fontSize:11}}>{a.tool_name}</div>
+                            <small style={{color:'#94a3b8',fontSize:9,display:'block',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>
+                              {a.args}
+                            </small>
+                          </div>
+                          <div style={{display:'flex',gap:6}}>
+                            <button
+                              onClick={() => decide(a.id, false)}
+                              style={{background:'#2d151a',color:'#f87171',border:'1px solid #7f1d1d',borderRadius:4,padding:'4px 8px',fontSize:10,cursor:'pointer'}}
+                            >
+                              Deny
+                            </button>
+                            <button
+                              onClick={() => decide(a.id, true)}
+                              style={{background:'#064e3b',color:'#34d399',border:'1px solid #047857',borderRadius:4,padding:'4px 8px',fontSize:10,cursor:'pointer'}}
+                            >
+                              Approve
+                            </button>
+                          </div>
+                        </div>
+                      ))
+                    )}
+                  </div>
+                </div>
+
+                {/* 2. Current Tasks & Active Execution Plans */}
+                <div className="overview-widget-card">
+                  <div className="overview-widget-header">
+                    <b>
+                      <Workflow size={16} color="#818cf8" />
+                      Current Tasks & Plans ({tasksList.filter((t: any) => t.status === 'in_progress' || t.status === 'pending').length})
+                    </b>
+                    <button onClick={() => { P('Tasks and Reminders'); setTrTab('plans'); }}>
+                      Open planner <ChevronRight size={13} />
+                    </button>
+                  </div>
+                  <div className="overview-widget-body">
+                    {tasksList.length === 0 ? (
+                      <div style={{color:'#64748b',fontSize:11,display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',height:'100%',textAlign:'center',padding:'20px 0'}}>
+                        <Workflow size={28} color="#475569" style={{marginBottom:8}} />
+                        <span>No active task plans. Ask your assistant to plan complex work.</span>
+                      </div>
+                    ) : (
+                      tasksList.slice(0, 4).map((t: any) => (
+                        <div key={t.task_id || t.id} className="overview-item-row">
+                          <div style={{flex:1,minWidth:0,marginRight:8}}>
+                            <div style={{fontWeight:600,color:'#f1f5f9',fontSize:11,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>
+                              {t.title || t.prompt || `Plan #${t.id}`}
+                            </div>
+                            <small style={{color:'#94a3b8',fontSize:9}}>
+                              {t.steps ? `${t.steps.length} steps` : 'Task plan'} · {new Date(t.created_at * 1000).toLocaleTimeString()}
+                            </small>
+                          </div>
+                          <span className={'status-badge ' + (t.status || 'pending')}>
+                            {t.status || 'pending'}
+                          </span>
+                        </div>
+                      ))
+                    )}
+                  </div>
+                </div>
+
+                {/* 3. Upcoming Reminders & Scheduled Automations */}
+                <div className="overview-widget-card">
+                  <div className="overview-widget-header">
+                    <b>
+                      <Calendar size={16} color="#38bdf8" />
+                      Reminders & Schedules ({asReminders.filter((r: any) => r.status === 'pending').length + schedulesList.filter((s: any) => s.enabled).length})
+                    </b>
+                    <button onClick={() => { P('Tasks and Reminders'); setTrTab('reminders'); }}>
+                      Manage <ChevronRight size={13} />
+                    </button>
+                  </div>
+                  <div className="overview-widget-body">
+                    {asReminders.length === 0 && schedulesList.length === 0 ? (
+                      <div style={{color:'#64748b',fontSize:11,display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',height:'100%',textAlign:'center',padding:'20px 0'}}>
+                        <Calendar size={28} color="#475569" style={{marginBottom:8}} />
+                        <span>No scheduled tasks or reminders set.</span>
+                      </div>
+                    ) : (
+                      <>
+                        {asReminders.slice(0, 3).map((r: any) => (
+                          <div key={r.id} className="overview-item-row">
+                            <div style={{flex:1,minWidth:0}}>
+                              <div style={{fontWeight:600,color:'#f1f5f9',fontSize:11}}>{r.title}</div>
+                              <small style={{color:'#94a3b8',fontSize:9}}>
+                                Due: {r.due_at ? new Date(r.due_at).toLocaleTimeString() : 'Upcoming'}
+                              </small>
+                            </div>
+                            <span className={'as-pill ' + (r.status || 'pending')}>{r.status}</span>
+                          </div>
+                        ))}
+                        {schedulesList.slice(0, 2).map((s: any) => (
+                          <div key={s.id} className="overview-item-row">
+                            <div style={{flex:1,minWidth:0}}>
+                              <div style={{fontWeight:600,color:'#cbd5e1',fontSize:11}}>{s.name}</div>
+                              <small style={{color:'#64748b',fontSize:9}}>Schedule: {s.schedule_type || 'periodic'}</small>
+                            </div>
+                            <span style={{fontSize:9,color:s.enabled ? '#34d399' : '#64748b',fontWeight:700}}>
+                              {s.enabled ? 'ACTIVE' : 'PAUSED'}
+                            </span>
+                          </div>
+                        ))}
+                      </>
+                    )}
+                  </div>
+                </div>
+
+                {/* 4. Recent Activity & Conversations */}
+                <div className="overview-widget-card">
+                  <div className="overview-widget-header">
+                    <b>
+                      <Clock3 size={16} color="#a855f7" />
+                      Recent Activity ({audit.length})
+                    </b>
+                    <button onClick={() => { P('Activity'); setActTab('audit'); }}>
+                      Full log <ChevronRight size={13} />
+                    </button>
+                  </div>
+                  <div className="overview-widget-body">
+                    {audit.length === 0 ? (
+                      <div style={{color:'#64748b',fontSize:11,display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',height:'100%',textAlign:'center',padding:'20px 0'}}>
+                        <Clock3 size={28} color="#475569" style={{marginBottom:8}} />
+                        <span>No recent activity logged yet.</span>
+                      </div>
+                    ) : (
+                      audit.slice(0, 4).map((a: any) => (
+                        <div key={a.id} className="overview-item-row">
+                          <div style={{flex:1,minWidth:0}}>
+                            <div style={{fontWeight:600,color:'#f1f5f9',fontSize:11,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>
+                              {a.event}
+                            </div>
+                            <small style={{color:'#94a3b8',fontSize:9,display:'block',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>
+                              {a.detail}
+                            </small>
+                          </div>
+                          <small style={{color:'#64748b',fontSize:8,marginLeft:8,whiteSpace:'nowrap'}}>
+                            {a.created_at ? new Date(a.created_at).toLocaleTimeString() : ''}
+                          </small>
+                        </div>
+                      ))
+                    )}
+                  </div>
+                </div>
               </div>
-              <div className="panel">
-                <h3>Quick actions</h3>
-                <small>Jump into your workflow</small>
-                <Quick icon={MessageSquare} title="Ask your AI" sub="Plan, reason and create" click={()=>P('Chat')}/>
-                <Quick icon={Globe} title="Web & Browser" sub="Automated navigation and search" click={()=>P('Browser')}/>
-                <Quick icon={Plug} title="Manage integrations" sub="Connect tools and MCP servers" click={()=>P('Tool Registry')}/>
-                <Quick icon={Bot} title="Configure AI models" sub="Gemini · Groq · OpenRouter" click={()=>P('Models')}/>
+
+              {/* Workspace Navigation Shortcuts */}
+              <div className="sectiontitle">
+                <div><b>Personal workspaces</b><small>Specialized capabilities for your everyday computer activities</small></div>
               </div>
-            </div>
-          </>}
+              <div style={{display:'grid',gridTemplateColumns:'repeat(4,1fr)',gap:12,marginBottom:20}}>
+                <button
+                  className="quick"
+                  onClick={() => P('Chat')}
+                  style={{background:'#111622',border:'1px solid #232f42',borderRadius:8,padding:14}}
+                >
+                  <MessageSquare size={20} color="#818cf8" />
+                  <div>
+                    <b style={{fontSize:11,color:'#f1f5f9'}}>Chat Assistant</b>
+                    <small style={{fontSize:9,color:'#94a3b8'}}>Conversational workspace & reasoning</small>
+                  </div>
+                </button>
+                <button
+                  className="quick"
+                  onClick={() => { P('Desktop Assistant'); setDaTab('desktop'); }}
+                  style={{background:'#111622',border:'1px solid #232f42',borderRadius:8,padding:14}}
+                >
+                  <Monitor size={20} color="#38bdf8" />
+                  <div>
+                    <b style={{fontSize:11,color:'#f1f5f9'}}>Desktop Assistant</b>
+                    <small style={{fontSize:9,color:'#94a3b8'}}>Screen vision, OCR & window controls</small>
+                  </div>
+                </button>
+                <button
+                  className="quick"
+                  onClick={() => P('Files')}
+                  style={{background:'#111622',border:'1px solid #232f42',borderRadius:8,padding:14}}
+                >
+                  <Folder size={20} color="#fbbf24" />
+                  <div>
+                    <b style={{fontSize:11,color:'#f1f5f9'}}>File Intelligence</b>
+                    <small style={{fontSize:9,color:'#94a3b8'}}>Deep search, duplicates & summaries</small>
+                  </div>
+                </button>
+                <button
+                  className="quick"
+                  onClick={() => P('Browser')}
+                  style={{background:'#111622',border:'1px solid #232f42',borderRadius:8,padding:14}}
+                >
+                  <Globe size={20} color="#34d399" />
+                  <div>
+                    <b style={{fontSize:11,color:'#f1f5f9'}}>Web Browser</b>
+                    <small style={{fontSize:9,color:'#94a3b8'}}>Automated research & navigation</small>
+                  </div>
+                </button>
+              </div>
+
+              {/* System Telemetry Bar */}
+              <div className="panel" style={{display:'flex',justifyContent:'space-between',alignItems:'center',padding:'12px 18px'}}>
+                <div style={{display:'flex',alignItems:'center',gap:16}}>
+                  <div style={{fontSize:11,color:'#94a3b8'}}>
+                    <strong style={{color:'#f1f5f9'}}>ThinkPad Core i5</strong> · {system.memory_total_gb || 8} GB RAM
+                  </div>
+                  <div style={{fontSize:11,color:'#94a3b8'}}>
+                    CPU: <strong style={{color:'#38bdf8'}}>{system.cpu_percent || 0}%</strong>
+                  </div>
+                  <div style={{fontSize:11,color:'#94a3b8'}}>
+                    RAM: <strong style={{color:'#818cf8'}}>{system.memory_percent || 0}%</strong>
+                  </div>
+                </div>
+                <button
+                  className="ghost"
+                  onClick={() => { P('Advanced / System'); setAdvTab('system'); }}
+                  style={{fontSize:10,color:'#818cf8',display:'flex',alignItems:'center',gap:4}}
+                >
+                  System details <ChevronRight size={12} />
+                </button>
+              </div>
+            </>
+          )}
 
           {page==='Chat'&&<div className="chatpage">
             <div className="chatmain">
@@ -2138,7 +2573,30 @@ export default function App() {
             </aside>
           </div>}
 
-          {page==='Tool Registry'&&<>
+          {(page === 'Advanced / System' || page === 'Models & Credentials' || page === 'Tool Registry & MCP' || page === 'System & Safety') && (
+            <div className="subtab-bar">
+              <button
+                className={'subtab-btn ' + ((page === 'Models & Credentials' || (page === 'Advanced / System' && advTab === 'models')) ? 'active' : '')}
+                onClick={() => { P('Advanced / System'); setAdvTab('models'); }}
+              >
+                <Bot size={14} /> Models & API Keys
+              </button>
+              <button
+                className={'subtab-btn ' + ((page === 'Tool Registry & MCP' || (page === 'Advanced / System' && advTab === 'tools')) ? 'active' : '')}
+                onClick={() => { P('Advanced / System'); setAdvTab('tools'); }}
+              >
+                <Boxes size={14} /> Tool Registry & MCP
+              </button>
+              <button
+                className={'subtab-btn ' + ((page === 'System & Safety' || (page === 'Advanced / System' && advTab === 'system')) ? 'active' : '')}
+                onClick={() => { P('Advanced / System'); setAdvTab('system'); }}
+              >
+                <Activity size={14} /> System Telemetry & Safety
+              </button>
+            </div>
+          )}
+
+          {(page==='Tool Registry' || page==='Tool Registry & MCP' || (page==='Advanced / System' && advTab==='tools'))&&<>
             <Heading tag="EXTENSIBILITY" title="Tool registry" desc="One control plane for native Python capabilities, browser automation, and MCP integrations." action={<button className="secondary" onClick={refresh}><RefreshCw size={14}/> Refresh registry</button>}/>
             <div className="stats registry-stats">
               <Stat label="Available tools" value={tools.length}/>
@@ -2331,7 +2789,7 @@ export default function App() {
             </div>
           </>}
 
-          {(page==='Models'||page==='Settings')&&<>
+          {(page==='Models'||page==='Settings'||page==='Models & Credentials'||(page==='Advanced / System' && advTab==='models'))&&<>
             <Heading tag="AI INFRASTRUCTURE" title="Models & Credentials" desc="Multi-key API backup, automatic rotation, DPAPI encryption at rest, and intelligent failover." action={<button className="secondary" onClick={()=>{refresh();loadCredentials();}}><RefreshCw size={14}/> Refresh status</button>}/>
             <div className="providers">
               {['gemini','groq','openrouter'].map(x => {
@@ -2965,66 +3423,90 @@ export default function App() {
             </div>
           </>}
 
-          {page==='Activity Log'&&<>
+          {(page==='Activity Log'||page==='Activity')&&<>
             <Heading tag="OBSERVABILITY" title="Activity & approvals" desc="Review tool activity and sensitive actions awaiting approval."/>
-            <div className="panel">
-              <h3>Pending approvals ({approvals.filter((a:any)=>a.status==='pending').length})</h3>
-              {approvals.filter((a:any)=>a.status==='pending').map((a:any)=>(
-                <div className="approval" key={a.id}>
-                  <div>
-                    <div className="approval-meta">
-                      <b>{a.tool_name}</b>
-                      <span className="risk approval">#{a.id}</span>
-                      {a.expires_at&&<small className="muted">Expires: {new Date(a.expires_at).toLocaleTimeString()}</small>}
-                    </div>
-                    <small>{a.args}</small>
-                  </div>
-                  <button onClick={()=>decide(a.id,false)}>Reject</button>
-                  <button className="approve" onClick={()=>decide(a.id,true)}>Approve</button>
-                </div>
-              ))}
-              {!approvals.filter((a:any)=>a.status==='pending').length&&<p className="muted">No pending approvals awaiting review.</p>}
+            
+            <div className="subtab-bar">
+              <button
+                className={'subtab-btn ' + (actTab === 'approvals' ? 'active' : '')}
+                onClick={() => setActTab('approvals')}
+              >
+                <ShieldCheck size={14} /> Approvals & Permissions ({approvals.filter((a:any)=>a.status==='pending').length} pending)
+              </button>
+              <button
+                className={'subtab-btn ' + (actTab === 'audit' ? 'active' : '')}
+                onClick={() => setActTab('audit')}
+              >
+                <Clock3 size={14} /> Tool Execution Audit Trail ({audit.length})
+              </button>
             </div>
 
-            <div className="panel">
-              <h3>Approval lifecycle & history</h3>
-              {approvals.filter((a:any)=>a.status!=='pending').map((a:any)=>(
-                <div className="approval" key={a.id}>
-                  <div>
-                    <div className="approval-meta">
-                      <b>{a.tool_name}</b>
-                      <span className={'status-badge '+a.status}>{a.status}</span>
-                      <small className="muted">#{a.id} · {a.decision_by||'user'} · {a.executed_at||a.decision_at||a.created_at}</small>
+            {actTab === 'approvals' && (
+              <>
+                <div className="panel">
+                  <h3>Pending approvals ({approvals.filter((a:any)=>a.status==='pending').length})</h3>
+                  {approvals.filter((a:any)=>a.status==='pending').map((a:any)=>(
+                    <div className="approval" key={a.id}>
+                      <div>
+                        <div className="approval-meta">
+                          <b>{a.tool_name}</b>
+                          <span className="risk approval">#{a.id}</span>
+                          {a.expires_at&&<small className="muted">Expires: {new Date(a.expires_at).toLocaleTimeString()}</small>}
+                        </div>
+                        <small>{a.args}</small>
+                      </div>
+                      <button onClick={()=>decide(a.id,false)}>Reject</button>
+                      <button className="approve" onClick={()=>decide(a.id,true)}>Approve</button>
                     </div>
-                    <small>{a.args}</small>
-                    {a.result&&<div className="approval-res"><strong>Result:</strong> {a.result}</div>}
-                    {a.error&&<div className="approval-res" style={{color:'#f09898'}}><strong>Error:</strong> {a.error}</div>}
-                  </div>
+                  ))}
+                  {!approvals.filter((a:any)=>a.status==='pending').length&&<p className="muted">No pending approvals awaiting review.</p>}
                 </div>
-              ))}
-              {!approvals.filter((a:any)=>a.status!=='pending').length&&<p className="muted">No historical approval records.</p>}
-            </div>
 
-            <div className="panel audit">
-              <h3>Recent activity</h3>
-              {audit.map((a:any)=>(
-                <div className="tool" key={a.id}>
-                  <div className="toolico"><Clock3 size={14}/></div>
-                  <div><b>{a.event}</b><small>{a.detail} · {a.created_at}</small></div>
+                <div className="panel">
+                  <h3>Approval lifecycle & history</h3>
+                  {approvals.filter((a:any)=>a.status!=='pending').map((a:any)=>(
+                    <div className="approval" key={a.id}>
+                      <div>
+                        <div className="approval-meta">
+                          <b>{a.tool_name}</b>
+                          <span className={'status-badge '+a.status}>{a.status}</span>
+                          <small className="muted">#{a.id} · {a.decision_by||'user'} · {a.executed_at||a.decision_at||a.created_at}</small>
+                        </div>
+                        <small>{a.args}</small>
+                        {a.result&&<div className="approval-res"><strong>Result:</strong> {a.result}</div>}
+                        {a.error&&<div className="approval-res" style={{color:'#f09898'}}><strong>Error:</strong> {a.error}</div>}
+                      </div>
+                    </div>
+                  ))}
+                  {!approvals.filter((a:any)=>a.status!=='pending').length&&<p className="muted">No historical approval records.</p>}
                 </div>
-              ))}
-            </div>
+              </>
+            )}
+
+            {actTab === 'audit' && (
+              <div className="panel audit">
+                <h3>Recent activity ({audit.length})</h3>
+                {audit.map((a:any)=>(
+                  <div className="tool" key={a.id}>
+                    <div className="toolico"><Clock3 size={14}/></div>
+                    <div><b>{a.event}</b><small>{a.detail} · {a.created_at}</small></div>
+                  </div>
+                ))}
+                {!audit.length && <p className="muted">No tool activity logged yet.</p>}
+              </div>
+            )}
           </>}
 
-          {page==='Tasks'&&<>
+          {(page==='Tasks'||page==='Tasks and Reminders')&&<>
             <Heading
               tag="AUTONOMOUS TASK MANAGEMENT"
-              title="Intelligent Tasks & Scheduler"
+              title="Tasks, Automations & Reminders"
               desc="Structured multi-step planning, dependency execution, checkpoints and persistent automation."
               action={
                 <div style={{display:'flex',gap:8}}>
                   <button className={tasksTab==='plans'?'primary':'ghost'} onClick={()=>setTasksTab('plans')}><Workflow size={15}/> Task Planner</button>
-                  <button className={tasksTab==='schedules'?'primary':'ghost'} onClick={()=>setTasksTab('schedules')}><Calendar size={15}/> Scheduler</button>
+                  <button className={tasksTab==='schedules'?'primary':'ghost'} onClick={()=>setTasksTab('schedules')}><Repeat size={15}/> Automations</button>
+                  <button className={tasksTab==='reminders'?'primary':'ghost'} onClick={()=>setTasksTab('reminders')}><Bell size={15}/> Reminders</button>
                 </div>
               }
             />
@@ -3034,7 +3516,10 @@ export default function App() {
                 <Workflow size={14}/> Executable Plans ({tasksList.length})
               </button>
               <button className={'phase-tab-btn '+(tasksTab==='schedules'?'active':'')} onClick={()=>setTasksTab('schedules')}>
-                <Calendar size={14}/> Scheduled Automation ({schedulesList.length})
+                <Repeat size={14}/> Scheduled Automation ({schedulesList.length})
+              </button>
+              <button className={'phase-tab-btn '+(tasksTab==='reminders'?'active':'')} onClick={()=>setTasksTab('reminders')}>
+                <Bell size={14}/> Personal Reminders ({asReminders.length})
               </button>
             </div>
 
@@ -3275,6 +3760,77 @@ export default function App() {
                 </div>
               </>
             )}
+
+            {tasksTab === 'reminders' && (
+              <>
+                <div className="panel" style={{marginBottom:16}}>
+                  <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:12}}>
+                    <b style={{fontSize:13,color:'#f1f5f9'}}>Set Personal Reminder</b>
+                    <small style={{color:'#94a3b8'}}>Configured for Windows 10 local notifications</small>
+                  </div>
+                  <div style={{display:'grid',gridTemplateColumns:'2fr 1fr 1fr auto',gap:10,alignItems:'center'}}>
+                    <input
+                      placeholder="What should I remind you about?..."
+                      value={remTitle}
+                      onChange={e => setRemTitle(e.target.value)}
+                      style={{background:'#0c1017',border:'1px solid #2a3547',borderRadius:6,padding:'8px 12px',color:'#fff',fontSize:12}}
+                    />
+                    <input
+                      type="datetime-local"
+                      value={remDueAt}
+                      onChange={e => setRemDueAt(e.target.value)}
+                      style={{background:'#0c1017',border:'1px solid #2a3547',borderRadius:6,padding:'8px 12px',color:'#fff',fontSize:11}}
+                    />
+                    <select
+                      value={remType}
+                      onChange={e => setRemType(e.target.value)}
+                      style={{background:'#0c1017',border:'1px solid #2a3547',borderRadius:6,padding:'8px 12px',color:'#fff',fontSize:11}}
+                    >
+                      <option value="one_time">One-time</option>
+                      <option value="daily">Daily</option>
+                      <option value="weekly">Weekly</option>
+                    </select>
+                    <button
+                      className="primary"
+                      onClick={createReminderAction}
+                      disabled={!remTitle.trim()}
+                      style={{padding:'8px 16px',fontSize:11}}
+                    >
+                      Add Reminder
+                    </button>
+                  </div>
+                </div>
+
+                <div className="panel">
+                  <h3>Active & Upcoming Reminders ({asReminders.length})</h3>
+                  {asReminders.map((r: any) => (
+                    <div key={r.id} className="as-rem-card">
+                      <div className="as-rem-info">
+                        <div className="as-rem-title">{r.title}</div>
+                        <div className="as-rem-meta">
+                          <span>Due: {r.due_at ? new Date(r.due_at).toLocaleString() : 'Soon'}</span>
+                          <span>· Type: {r.reminder_type || 'one_time'}</span>
+                        </div>
+                      </div>
+                      <div style={{display:'flex',gap:8,alignItems:'center'}}>
+                        <span className={'as-pill ' + (r.status || 'pending')}>{r.status}</span>
+                        {r.status === 'pending' && (
+                          <button
+                            onClick={() => dismissReminder(r.id)}
+                            style={{background:'#16202f',color:'#a2c4e8',border:'1px solid #283648',borderRadius:5,padding:'4px 8px',fontSize:10,cursor:'pointer'}}
+                          >
+                            Dismiss
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  ))}
+                  {!asReminders.length && (
+                    <p className="muted">No reminders set. Use the form above to schedule reminders.</p>
+                  )}
+                </div>
+              </>
+            )}
           </>}
 
           {page==='Memory'&&<>
@@ -3437,7 +3993,30 @@ export default function App() {
             </div>
           </>}
 
-          {page==='Desktop'&&<>
+          {page === 'Desktop Assistant' && (
+            <div className="subtab-bar">
+              <button
+                className={'subtab-btn ' + (daTab === 'proactive' ? 'active' : '')}
+                onClick={() => setDaTab('proactive')}
+              >
+                <Sparkles size={14} /> Proactive Briefing & Monitors
+              </button>
+              <button
+                className={'subtab-btn ' + (daTab === 'desktop' ? 'active' : '')}
+                onClick={() => setDaTab('desktop')}
+              >
+                <Monitor size={14} /> Windows Desktop Controls
+              </button>
+              <button
+                className={'subtab-btn ' + (daTab === 'vision' ? 'active' : '')}
+                onClick={() => setDaTab('vision')}
+              >
+                <Eye size={14} /> Visual Intelligence & OCR
+              </button>
+            </div>
+          )}
+
+          {(page==='Desktop' || (page==='Desktop Assistant' && daTab==='desktop'))&&<>
             <Heading tag="WINDOWS AUTOMATION" title="Desktop control engine" desc="Inspect application windows, capture screen telemetry, navigate accessible UI controls, and execute approved mouse/keyboard actions." action={
               <div style={{display:'flex',gap:'8px'}}>
                 <button className="secondary" onClick={()=>captureDesktopScreen('desktop')} disabled={dLoading}><Camera size={14}/> Capture screen</button>
@@ -3640,7 +4219,7 @@ export default function App() {
             </div>
           </>}
 
-          {page==='Visual AI'&&<>
+          {(page==='Visual AI' || (page==='Desktop Assistant' && daTab==='vision'))&&<>
             <Heading tag="COMPUTER VISION" title="Visual desktop intelligence" desc="Analyze screen contents, extract OCR text, detect UI components, locate visual targets, and compare desktop states." action={
               <div style={{display:'flex',gap:'8px'}}>
                 <button className="secondary" onClick={()=>setVTarget(vTarget==='desktop'?'window':'desktop')} disabled={vLoading}>
@@ -4569,7 +5148,7 @@ export default function App() {
             )}
           </>}
 
-          {page === 'Assistant' && <>
+          {(page === 'Assistant' || (page === 'Desktop Assistant' && daTab === 'proactive')) && <>
             <Heading
               tag="PHASE 6 QUEUE 4"
               title="Proactive Personal Assistance"
@@ -5011,7 +5590,105 @@ export default function App() {
             )}
           </>}
 
-          {!['Overview','Assistant','Chat','Tool Registry','Models','Settings','Activity Log','Browser','Tasks','Memory','Desktop','Visual AI','Files'].includes(page)&&(
+          {(page === 'System' || page === 'System & Safety' || (page === 'Advanced / System' && advTab === 'system')) && (
+            <>
+              <Heading
+                tag="HARDWARE & SECURITY"
+                title="System Telemetry & Safety"
+                desc="Windows 10 host health, Intel Core i5 runtime telemetry, emergency controls, and local security posture."
+                action={
+                  <div style={{display:'flex',gap:8}}>
+                    {emergency.is_stopped ? (
+                      <button className="emergency-active-btn" onClick={clearEmergency}>
+                        <AlertTriangle size={14} /> Resume Engine
+                      </button>
+                    ) : (
+                      <button className="emergency-stop-btn" onClick={() => setShowStopModal(true)}>
+                        <StopCircle size={14} /> Emergency Stop
+                      </button>
+                    )}
+                    <button className="secondary" onClick={refresh}>
+                      <RefreshCw size={14} /> Refresh
+                    </button>
+                  </div>
+                }
+              />
+
+              <div className="stats">
+                <Stat icon={Cpu} label="CPU Utilization" value={(system.cpu_percent || 0) + '%'} note="Intel Core i5-6300U @ 2.40GHz" />
+                <Stat icon={Activity} label="Memory In Use" value={(system.memory_percent || 0) + '%'} note={`${system.memory_total_gb || 8} GB Installed RAM`} />
+                <Stat icon={Folder} label="Disk Utilization" value={(system.disk_percent || 0) + '%'} note="238 GB SSD Host Storage" />
+                <Stat icon={ShieldCheck} label="Security Status" value="ENFORCED" note="DPAPI + Loopback Origin Check" />
+              </div>
+
+              <div className="lower" style={{marginTop:16}}>
+                <div className="panel">
+                  <h3>Host Machine Hardware</h3>
+                  <small>Target device telemetry</small>
+                  <div style={{display:'flex',flexDirection:'column',gap:10,fontSize:11,color:'#cbd5e1',marginTop:12}}>
+                    <div style={{display:'flex',justifyContent:'space-between',borderBottom:'1px solid #1c2636',paddingBottom:6}}>
+                      <span style={{color:'#94a3b8'}}>Processor</span>
+                      <strong>Intel(R) Core(TM) i5-6300U CPU @ 2.40GHz</strong>
+                    </div>
+                    <div style={{display:'flex',justifyContent:'space-between',borderBottom:'1px solid #1c2636',paddingBottom:6}}>
+                      <span style={{color:'#94a3b8'}}>Installed RAM</span>
+                      <strong>{system.memory_total_gb || 8} GB DDR3/DDR4</strong>
+                    </div>
+                    <div style={{display:'flex',justifyContent:'space-between',borderBottom:'1px solid #1c2636',paddingBottom:6}}>
+                      <span style={{color:'#94a3b8'}}>Operating System</span>
+                      <strong>Microsoft Windows 10 Pro (x64)</strong>
+                    </div>
+                    <div style={{display:'flex',justifyContent:'space-between',borderBottom:'1px solid #1c2636',paddingBottom:6}}>
+                      <span style={{color:'#94a3b8'}}>Integrated Graphics</span>
+                      <strong>Intel HD Graphics 520</strong>
+                    </div>
+                    <div style={{display:'flex',justifyContent:'space-between',borderBottom:'1px solid #1c2636',paddingBottom:6}}>
+                      <span style={{color:'#94a3b8'}}>Architecture</span>
+                      <strong>Single-User Personal Desktop AI</strong>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="panel">
+                  <h3>Safety & Access Controls</h3>
+                  <small>Security policy and fail-safe controls</small>
+                  <div style={{display:'flex',flexDirection:'column',gap:12,marginTop:12}}>
+                    <div style={{background:emergency.is_stopped?'#450a0a':'#0c1420',border:'1px solid '+(emergency.is_stopped?'#ef4444':'#202e42'),borderRadius:8,padding:12}}>
+                      <div style={{display:'flex',justifyContent:'space-between',alignItems:'center'}}>
+                        <div>
+                          <b style={{fontSize:12,color:emergency.is_stopped?'#fca5a5':'#f1f5f9'}}>Global Emergency Stop</b>
+                          <small style={{display:'block',color:'#94a3b8',fontSize:10,marginTop:2}}>
+                            {emergency.is_stopped ? `Stopped at ${emergency.stopped_at}: ${emergency.reason}` : 'System running normally. Click to pause all automated execution.'}
+                          </small>
+                        </div>
+                        {emergency.is_stopped ? (
+                          <button className="emergency-resume-btn" onClick={clearEmergency}>Resume</button>
+                        ) : (
+                          <button className="emergency-stop-btn" onClick={() => setShowStopModal(true)}>Engage Stop</button>
+                        )}
+                      </div>
+                    </div>
+
+                    <div style={{background:'#0c1420',border:'1px solid #202e42',borderRadius:8,padding:12}}>
+                      <b style={{fontSize:12,color:'#f1f5f9'}}>Local Loopback & Origin Protection</b>
+                      <small style={{display:'block',color:'#94a3b8',fontSize:10,marginTop:2}}>
+                        Strict origin enforcement: Requests are restricted to localhost:5173 loopback with DPAPI-encrypted credential storage.
+                      </small>
+                    </div>
+
+                    <div style={{background:'#0c1420',border:'1px solid #202e42',borderRadius:8,padding:12}}>
+                      <b style={{fontSize:12,color:'#f1f5f9'}}>30-Day Durable Session</b>
+                      <small style={{display:'block',color:'#94a3b8',fontSize:10,marginTop:2}}>
+                        Session token persisted in SQLite with rolling activity renewal. Survives backend restarts and laptop reboots.
+                      </small>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </>
+          )}
+
+          {!['Overview','Assistant','Chat','Tool Registry','Models','Settings','Activity Log','Browser','Tasks','Memory','Desktop','Visual AI','Files','Desktop Assistant','Tasks and Reminders','Activity','Models & Credentials','Tool Registry & MCP','System & Safety','Advanced / System','System'].includes(page)&&(
             <div className="coming">
               <Sparkles/>
               <h1>{page}</h1>

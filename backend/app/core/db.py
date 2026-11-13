@@ -122,6 +122,29 @@ def init_db():
         );
         """)
         c.execute("CREATE INDEX IF NOT EXISTS idx_provider_telem_prov ON provider_telemetry(provider, created_at);")
+
+        # Personal Session Management (Persistent Local Sessions across restart)
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS local_sessions (
+            token TEXT PRIMARY KEY,
+            created_at REAL NOT NULL,
+            expires_at REAL NOT NULL,
+            revoked INTEGER DEFAULT 0,
+            client_info TEXT DEFAULT 'local',
+            last_active_at REAL NOT NULL
+        );
+        """)
+        c.execute("CREATE INDEX IF NOT EXISTS idx_sessions_active ON local_sessions(token, revoked, expires_at);")
+
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS one_time_setup_tickets (
+            ticket TEXT PRIMARY KEY,
+            created_at REAL NOT NULL,
+            expires_at REAL NOT NULL,
+            used INTEGER DEFAULT 0
+        );
+        """)
+
         c.execute("""
         CREATE TABLE IF NOT EXISTS mcp_servers(
             id TEXT PRIMARY KEY,

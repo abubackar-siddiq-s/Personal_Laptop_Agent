@@ -101,7 +101,9 @@ class TestSessionAuthenticationSecurity(unittest.TestCase):
         res = self.client.post("/api/auth/rotate", headers=headers)
         self.assertEqual(res.status_code, 200)
         data = res.json()
-        new_token = data.get("session_token")
+        self.assertNotIn("session_token", data)
+        self.assertEqual(data.get("status"), "active")
+        new_token = res.cookies.get("laptop_ai_session")
         self.assertIsNotNone(new_token)
         self.assertNotEqual(old_token, new_token)
 
@@ -135,14 +137,12 @@ class TestSessionAuthenticationSecurity(unittest.TestCase):
         )
         self.assertEqual(res.status_code, 200)
         data = res.json()
-        issued_token = data.get("session_token")
+        self.assertNotIn("session_token", data)
+        self.assertEqual(data.get("status"), "active")
+        issued_token = res.cookies.get("laptop_ai_session")
         self.assertIsNotNone(issued_token)
         self.assertEqual(len(issued_token), 64)
         self.assertTrue(validate_session_token(issued_token))
-
-        # Check that cookie was set
-        cookies = res.cookies
-        self.assertEqual(cookies.get("laptop_ai_session"), issued_token)
 
     # 9. Unauthorized Localhost Origin / Port Rejection
     def test_09_unauthorized_localhost_port_rejection(self):
@@ -190,7 +190,7 @@ class TestSessionAuthenticationSecurity(unittest.TestCase):
                 continue
 
             full_path = "/api" + path
-            if full_path.endswith("/emergency/stop") or full_path.endswith("/auth/session"):
+            if full_path.endswith("/emergency/stop") or full_path.endswith("/auth/session") or full_path.endswith("/auth/setup"):
                 continue
 
             test_path = (

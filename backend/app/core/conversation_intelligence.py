@@ -98,12 +98,11 @@ async def maybe_summarize_conversation(
         return None
 
     # Check if we already summarized this conversation recently
-    existing_sum = memory_engine.search(
-        f"Conversation #{conversation_id}",
-        category="conversation_summary",
-        status="active",
-        limit=1,
-    )
+    with conn() as c:
+        existing_sum = c.execute(
+            "SELECT id FROM memories WHERE category = 'conversation_summary' AND conversation_id = ? AND status = 'active' LIMIT 1",
+            (conversation_id,),
+        ).fetchone()
     if existing_sum and len(msgs) < 14:
         return None
 

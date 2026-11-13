@@ -75,6 +75,23 @@ def get_or_create_bootstrap_secret() -> str:
     return _BOOTSTRAP_SECRET
 
 
+def rotate_bootstrap_secret() -> str:
+    """
+    Generate and overwrite with a brand-new cryptographic bootstrap secret.
+    Stored exclusively in backend-protected storage (%USERPROFILE%/.laptop_ai/bootstrap.token).
+    Never logged or exposed.
+    """
+    global _BOOTSTRAP_SECRET
+    _BOOTSTRAP_SECRET = secrets.token_hex(32)
+    BOOTSTRAP_FILE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    BOOTSTRAP_FILE_PATH.write_text(_BOOTSTRAP_SECRET, encoding="utf-8")
+    try:
+        os.chmod(BOOTSTRAP_FILE_PATH, 0o600)
+    except Exception:
+        pass
+    return _BOOTSTRAP_SECRET
+
+
 def validate_bootstrap_token(token: str | None) -> bool:
     """Validate submitted bootstrap credential using constant-time comparison."""
     if not token:
@@ -84,7 +101,7 @@ def validate_bootstrap_token(token: str | None) -> bool:
 
 
 # -------------------------------------------------------------
-# SESSION TOKEN REGISTRY & ROTATION LIFECYCLE
+# SESSION TOKEN REGISTRY & ROTATION LIFECYCLE (DURABLE SQLITE)
 # -------------------------------------------------------------
 @dataclass
 class SessionRecord:
@@ -98,8 +115,8 @@ class SessionRecord:
 _SESSIONS: dict[str, SessionRecord] = {}
 
 
-def create_session_token(ttl_seconds: int = 86400, client_info: str = "local") -> SessionRecord:
-    """Issue a new process-bound session token with cryptographic randomness and TTL."""
+def create_session_token(ttl_seconds: int = 30 * 86400, client_info: str = "local") -> SessionRecord:
+    """Issue a new durable session token with cryptographic randomness and 30-day default TTL."""
     token = secrets.token_hex(32)
     now = time.time()
     record = SessionRecord(
@@ -110,52 +127,142 @@ def create_session_token(ttl_seconds: int = 86400, client_info: str = "local") -
         client_info=client_info,
     )
     _SESSIONS[token] = record
+    try:
+        with conn() as c:
+            c.execute(
+                """
+                INSERT OR REPLACE INTO local_sessions (token, created_at, expires_at, revoked, client_info, last_active_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (token, now, now + ttl_seconds, 0, client_info, now),
+            )
+    except Exception:
+        pass
     return record
 
 
 def validate_session_token(token: str | None) -> bool:
     """
     Validate session token using constant-time comparison, checking expiration and revocation.
-    Rejects missing, invalid, expired, or revoked tokens.
+    Backed by SQLite local_sessions to persist across backend restarts and browser sessions.
     """
     if not token:
         return False
     token_str = str(token).strip()
+    now = time.time()
+
+    # 1. Fast path: check in-memory cache
     record = _SESSIONS.get(token_str)
-    if not record:
+    if record:
+        if record.revoked or record.expires_at <= now:
+            return False
+        return hmac.compare_digest(token_str, record.token)
+
+    # 2. Database path: check persistent SQLite local_sessions
+    try:
+        with conn() as c:
+            row = c.execute(
+                "SELECT token, created_at, expires_at, revoked, client_info, last_active_at FROM local_sessions WHERE token = ?",
+                (token_str,),
+            ).fetchone()
+            if not row:
+                return False
+            if bool(row["revoked"]) or row["expires_at"] <= now:
+                return False
+
+            record = SessionRecord(
+                token=row["token"],
+                created_at=row["created_at"],
+                expires_at=row["expires_at"],
+                revoked=bool(row["revoked"]),
+                client_info=row["client_info"] or "local",
+            )
+            _SESSIONS[token_str] = record
+
+            # Rolling extension if within 7 days of expiry
+            if row["expires_at"] - now < 7 * 86400:
+                new_expiry = now + 30 * 86400
+                record.expires_at = new_expiry
+                c.execute(
+                    "UPDATE local_sessions SET last_active_at = ?, expires_at = ? WHERE token = ?",
+                    (now, new_expiry, token_str),
+                )
+            else:
+                c.execute("UPDATE local_sessions SET last_active_at = ? WHERE token = ?", (now, token_str))
+
+            return hmac.compare_digest(token_str, record.token)
+    except Exception:
         return False
-    if record.revoked:
-        return False
-    if record.expires_at <= time.time():
-        return False
-    return hmac.compare_digest(token_str, record.token)
 
 
-def rotate_session_token(old_token: str | None, ttl_seconds: int = 86400) -> SessionRecord | None:
+def rotate_session_token(old_token: str | None, ttl_seconds: int = 30 * 86400) -> SessionRecord | None:
     """Rotate an existing valid session token. Revokes the old token and issues a new active token."""
     if not old_token or not validate_session_token(old_token):
         return None
     token_str = str(old_token).strip()
-    _SESSIONS[token_str].revoked = True
-    return create_session_token(ttl_seconds=ttl_seconds, client_info=_SESSIONS[token_str].client_info)
+    client_info = _SESSIONS[token_str].client_info if token_str in _SESSIONS else "local"
+    revoke_session_token(token_str)
+    return create_session_token(ttl_seconds=ttl_seconds, client_info=client_info)
 
 
 def revoke_session_token(token: str | None) -> bool:
-    """Explicitly revoke an active session token."""
+    """Explicitly revoke an active session token both in memory and in SQLite."""
     if not token:
         return False
     token_str = str(token).strip()
     if token_str in _SESSIONS:
         _SESSIONS[token_str].revoked = True
-        return True
-    return False
+    try:
+        with conn() as c:
+            res = c.execute("UPDATE local_sessions SET revoked = 1 WHERE token = ?", (token_str,))
+            return res.rowcount > 0 or token_str in _SESSIONS
+    except Exception:
+        return token_str in _SESSIONS
+
+
+def create_setup_ticket(ttl_seconds: int = 120) -> str:
+    """Generate a single-use, short-lived setup ticket for trusted local first-run onboarding."""
+    ticket = secrets.token_urlsafe(32)
+    now = time.time()
+    try:
+        with conn() as c:
+            c.execute("DELETE FROM one_time_setup_tickets WHERE expires_at < ? OR used = 1", (now,))
+            c.execute(
+                "INSERT INTO one_time_setup_tickets (ticket, created_at, expires_at, used) VALUES (?, ?, ?, 0)",
+                (ticket, now, now + ttl_seconds),
+            )
+    except Exception:
+        pass
+    return ticket
+
+
+def consume_setup_ticket(ticket: str | None) -> bool:
+    """Atomically consume a single-use setup ticket."""
+    if not ticket:
+        return False
+    t_str = str(ticket).strip()
+    now = time.time()
+    try:
+        with conn() as c:
+            c.execute("BEGIN IMMEDIATE;")
+            row = c.execute(
+                "SELECT ticket FROM one_time_setup_tickets WHERE ticket = ? AND used = 0 AND expires_at > ?",
+                (t_str, now),
+            ).fetchone()
+            if not row:
+                c.execute("ROLLBACK;")
+                return False
+            c.execute("UPDATE one_time_setup_tickets SET used = 1 WHERE ticket = ?", (t_str,))
+            c.execute("COMMIT;")
+            return True
+    except Exception:
+        return False
 
 
 def get_test_session_token() -> str:
     """Generate or retrieve a verified session token for test suites."""
-    # Find any active unexpired test session or create one
     now = time.time()
-    for tok, rec in _SESSIONS.items():
+    for tok, rec in list(_SESSIONS.items()):
         if rec.client_info == "test_suite" and not rec.revoked and rec.expires_at > now:
             return tok
     rec = create_session_token(ttl_seconds=86400, client_info="test_suite")

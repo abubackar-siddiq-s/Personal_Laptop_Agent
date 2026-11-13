@@ -327,7 +327,7 @@ class TestPhase7Remediation(unittest.TestCase):
         client = TestClient(app)
         b_token = get_or_create_bootstrap_secret()
         auth_res = client.post("/api/auth/session", json={"bootstrap_token": b_token})
-        sess_token = auth_res.json()["session_token"]
+        sess_token = auth_res.cookies.get("laptop_ai_session")
         headers = {"X-Session-Token": sess_token}
 
         req_id = admission_controller.queue_request(conversation_id=11, prompt="Cancel via API")

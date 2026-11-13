@@ -108,10 +108,13 @@ def verify_local_origin(request: Request):
         # Bootstrap authentication endpoint validates bootstrap secret separately
         if path.endswith("/auth/session"):
             return
+        # One-time setup endpoint validates single-use setup ticket separately
+        if path.endswith("/auth/setup"):
+            return
 
         token = (
-            request.headers.get("X-Session-Token")
-            or request.cookies.get("laptop_ai_session")
+            request.cookies.get("laptop_ai_session")
+            or request.headers.get("X-Session-Token")
             or request.headers.get("authorization", "").replace("Bearer ", "").strip()
         )
         from app.core.security import validate_session_token
@@ -130,11 +133,46 @@ class SessionAuthReq(BaseModel):
     bootstrap_token: str = Field(..., description="Cryptographic bootstrap secret")
 
 
-@r.post("/auth/session")
-def authenticate_session(req: SessionAuthReq, response: Response):
+class SetupTicketReq(BaseModel):
+    setup_ticket: str = Field(..., description="Single-use setup ticket")
+
+
+@r.post("/auth/setup")
+def setup_session(req: SetupTicketReq, request: Request, response: Response):
     """
-    Authenticate using local bootstrap secret and issue an active session token.
-    Enforces bootstrap authorization before issuing a session token.
+    Exchange a valid single-use setup ticket for a persistent 30-day session token.
+    Enforces atomic one-time consumption and issues HttpOnly session cookie.
+    Session tokens are strictly kept server-side and NEVER returned in API responses.
+    """
+    from app.core.security import consume_setup_ticket, create_session_token
+    if not consume_setup_ticket(req.setup_ticket):
+        raise HTTPException(
+            401,
+            "Setup Security Violation: Invalid, expired, or already used setup ticket.",
+        )
+    session = create_session_token(ttl_seconds=30 * 86400, client_info="one_time_setup")
+    is_secure = request.url.scheme == "https"
+    response.set_cookie(
+        key="laptop_ai_session",
+        value=session.token,
+        httponly=True,
+        samesite="lax",
+        secure=is_secure,
+        max_age=30 * 86400,
+        path="/",
+    )
+    return {
+        "status": "active",
+        "expires_at": session.expires_at,
+    }
+
+
+@r.post("/auth/session")
+def authenticate_session(req: SessionAuthReq, request: Request, response: Response):
+    """
+    Authenticate using local bootstrap secret and issue an active session cookie.
+    Enforces bootstrap authorization.
+    Session tokens are strictly kept server-side and NEVER returned in API responses.
     """
     from app.core.security import validate_bootstrap_token, create_session_token
     if not validate_bootstrap_token(req.bootstrap_token):
@@ -142,27 +180,29 @@ def authenticate_session(req: SessionAuthReq, response: Response):
             401,
             "Bootstrap Security Violation: Invalid or unauthorized bootstrap credential.",
         )
-    session = create_session_token(ttl_seconds=86400, client_info="authenticated_session")
+    session = create_session_token(ttl_seconds=30 * 86400, client_info="authenticated_session")
+    is_secure = request.url.scheme == "https"
     response.set_cookie(
         key="laptop_ai_session",
         value=session.token,
         httponly=True,
-        samesite="strict",
-        secure=False,
+        samesite="lax",
+        secure=is_secure,
+        max_age=30 * 86400,
+        path="/",
     )
     return {
-        "session_token": session.token,
-        "expires_at": session.expires_at,
         "status": "active",
+        "expires_at": session.expires_at,
     }
 
 
 @r.post("/auth/rotate")
 def rotate_session(request: Request, response: Response):
-    """Rotate active session token. Invalidates old token and issues a new active token."""
+    """Rotate active session token. Invalidates old token and issues a new active token via HttpOnly cookie."""
     token = (
-        request.headers.get("X-Session-Token")
-        or request.cookies.get("laptop_ai_session")
+        request.cookies.get("laptop_ai_session")
+        or request.headers.get("X-Session-Token")
         or request.headers.get("authorization", "").replace("Bearer ", "").strip()
     )
     from app.core.security import rotate_session_token
@@ -172,31 +212,40 @@ def rotate_session(request: Request, response: Response):
             401,
             "Session Security Violation: Cannot rotate invalid, expired, or revoked session.",
         )
+    is_secure = request.url.scheme == "https"
     response.set_cookie(
         key="laptop_ai_session",
         value=new_session.token,
         httponly=True,
-        samesite="strict",
-        secure=False,
+        samesite="lax",
+        secure=is_secure,
+        max_age=30 * 86400,
+        path="/",
     )
     return {
-        "session_token": new_session.token,
-        "expires_at": new_session.expires_at,
         "status": "active",
+        "expires_at": new_session.expires_at,
     }
 
 
 @r.post("/auth/revoke")
 def revoke_session(request: Request, response: Response):
-    """Explicitly revoke active session token."""
+    """Explicitly revoke active session token and delete session cookie."""
     token = (
-        request.headers.get("X-Session-Token")
-        or request.cookies.get("laptop_ai_session")
+        request.cookies.get("laptop_ai_session")
+        or request.headers.get("X-Session-Token")
         or request.headers.get("authorization", "").replace("Bearer ", "").strip()
     )
     from app.core.security import revoke_session_token
     revoked = revoke_session_token(token)
-    response.delete_cookie(key="laptop_ai_session")
+    is_secure = request.url.scheme == "https"
+    response.delete_cookie(
+        key="laptop_ai_session",
+        path="/",
+        samesite="lax",
+        secure=is_secure,
+        httponly=True,
+    )
     return {"status": "revoked" if revoked else "not_found"}
 
 
@@ -204,8 +253,8 @@ def revoke_session(request: Request, response: Response):
 def get_session_status(request: Request):
     """Check whether the client possesses an active, valid session without leaking tokens."""
     token = (
-        request.headers.get("X-Session-Token")
-        or request.cookies.get("laptop_ai_session")
+        request.cookies.get("laptop_ai_session")
+        or request.headers.get("X-Session-Token")
         or request.headers.get("authorization", "").replace("Bearer ", "").strip()
     )
     from app.core.security import validate_session_token
@@ -244,7 +293,7 @@ class Run(BaseModel):
 
 @r.get("/health")
 def health():
-    return {"ok": True, "name": "LAPTOP AI", "version": "0.2.0"}
+    return {"status": "ok", "ok": True, "name": "LAPTOP AI", "version": "0.2.0"}
 
 
 @r.get("/providers")
