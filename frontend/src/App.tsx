@@ -11,7 +11,7 @@ import {
 
 const API = 'http://127.0.0.1:8000/api';
 type Tool = {name:string;description:string;source:string;risk:string};
-type Msg = {role:string;content:string};
+type Msg = {role:string;content:string;queue_request_id?:string};
 
 const nav = [
   ['Overview',LayoutDashboard],
@@ -54,11 +54,12 @@ export default function App() {
   const [url,U] = useState('');
   const [notice,Z] = useState('');
 
-  // Resilience & Fallback State
+  // Resilience & Fallback State (Mandatory Fallback)
   const [infStatus, setInfStatus] = useState<string>('');
-  const [autoFallback, setAutoFallback] = useState<boolean>(false);
+  const [autoFallback, setAutoFallback] = useState<boolean>(true);
   const [fbProvider, setFbProvider] = useState<string>('gemini');
   const [fbModel, setFbModel] = useState<string>('gemini-2.5-flash');
+  const [controlCenter, setControlCenter] = useState<any>(null);
 
   // Browser Workspace State
   const [bStatus, setBStatus] = useState<any>({ is_running: false, tab_count: 0 });
@@ -316,14 +317,16 @@ export default function App() {
 
   async function refresh() {
     try {
-      let[t,s,v,a,q,y,stg,emg,credsRes,healthRes] = await Promise.all([
+      let[t,s,v,a,q,y,stg,emg,credsRes,healthRes,ccRes] = await Promise.all([
         req('/tools'),req('/mcp/servers'),req('/providers'),req('/audit'),req('/approvals'),req('/system'),req('/settings'),req('/emergency/status'),
         req('/providers/credentials').catch(()=>({credentials:[]})),
-        req('/providers/credentials/health').catch(()=>({metrics:{}}))
+        req('/providers/credentials/health').catch(()=>({metrics:{}})),
+        req('/inference/control-center').catch(()=>null)
       ]);
       T(t);S(s);V(v);A(a);Q(q);Y(y);
       if (credsRes?.credentials) setCredentials(credsRes.credentials);
       if (healthRes?.metrics) setCredHealth(healthRes.metrics);
+      if (ccRes) setControlCenter(ccRes);
       if (emg) setEmergency(emg);
       if (stg) {
         setAutoFallback(Boolean(stg.auto_provider_fallback));
@@ -350,7 +353,7 @@ export default function App() {
         try {
           let latestMsgs = await req(`/conversations/${cid}/messages`);
           if (Array.isArray(latestMsgs)) {
-            let mapped = latestMsgs.map((m: any) => ({ role: m.role, content: m.content }));
+            let mapped = latestMsgs.map((m: any) => ({ role: m.role, content: m.content, queue_request_id: m.queue_request_id }));
             M(prev => {
               if (prev.length !== mapped.length || JSON.stringify(prev) !== JSON.stringify(mapped)) {
                 return mapped;
@@ -788,16 +791,42 @@ export default function App() {
     }
   }
 
-  async function toggleAutoFallback(enabled: boolean) {
+  async function toggleAutoFallback(_enabled: boolean) {
+    // Mandatory policy enforcement: Auto Provider Fallback is permanently enabled
+    setAutoFallback(true);
+    Z('Auto Provider Fallback is mandatory and permanently enabled for HTTP 429 resilience.');
+  }
+
+  async function pauseBackgroundWork() {
     try {
-      let res = await req('/settings', {
-        method: 'POST',
-        body: JSON.stringify({ auto_provider_fallback: enabled, fallback_provider: fbProvider, fallback_model: fbModel })
-      });
-      setAutoFallback(Boolean(res.auto_provider_fallback));
-      Z(enabled ? 'Auto Provider Fallback enabled (will failover to Gemini if Groq limits).' : 'Auto Provider Fallback disabled.');
+      await req('/inference/queue/pause-background', { method: 'POST' });
+      let cc = await req('/inference/control-center').catch(() => null);
+      if (cc) setControlCenter(cc);
+      Z('Background inference tasks paused.');
     } catch (e: any) {
-      Z(`Failed to update fallback setting: ${e.message}`);
+      Z(`Failed to pause background inference: ${e.message}`);
+    }
+  }
+
+  async function resumeBackgroundWork() {
+    try {
+      await req('/inference/queue/resume-background', { method: 'POST' });
+      let cc = await req('/inference/control-center').catch(() => null);
+      if (cc) setControlCenter(cc);
+      Z('Background inference tasks resumed.');
+    } catch (e: any) {
+      Z(`Failed to resume background inference: ${e.message}`);
+    }
+  }
+
+  async function cancelQueuedRequest(id: string) {
+    try {
+      await req(`/inference/queue/${id}/cancel`, { method: 'POST' });
+      let cc = await req('/inference/control-center').catch(() => null);
+      if (cc) setControlCenter(cc);
+      Z(`Queued request ${id} cancelled.`);
+    } catch (e: any) {
+      Z(`Failed to cancel request: ${e.message}`);
     }
   }
 
@@ -1412,6 +1441,37 @@ export default function App() {
     return () => clearInterval(i);
   }, [page, memCat, memSearch]);
 
+  // Active conversation auto-updater for queued responses
+  useEffect(() => {
+    if (page !== 'Chat' || !cid) return;
+
+    let hasQueuedMessage = msgs.some(
+      m => m.content && (m.content.includes('Rate Limit Reached') || m.content.includes('safely queued'))
+    );
+    let pollInterval = hasQueuedMessage ? 2000 : 5000;
+
+    let timer = setInterval(async () => {
+      try {
+        let latestMsgs = await req(`/conversations/${cid}/messages`);
+        if (Array.isArray(latestMsgs)) {
+          let mapped = latestMsgs.map((m: any) => ({
+            role: m.role,
+            content: m.content,
+            queue_request_id: m.queue_request_id,
+          }));
+          M(prev => {
+            if (prev.length !== mapped.length || JSON.stringify(prev) !== JSON.stringify(mapped)) {
+              return mapped;
+            }
+            return prev;
+          });
+        }
+      } catch (_) {}
+    }, pollInterval);
+
+    return () => clearInterval(timer);
+  }, [page, cid, msgs]);
+
   async function summarizeChat() {
     if (!cid) {
       Z('No active conversation to summarize.');
@@ -1527,7 +1587,7 @@ export default function App() {
         try {
           let latestMsgs = await req(`/conversations/${cid}/messages`);
           if (Array.isArray(latestMsgs)) {
-            M(latestMsgs.map((m: any) => ({ role: m.role, content: m.content })));
+            M(latestMsgs.map((m: any) => ({ role: m.role, content: m.content, queue_request_id: m.queue_request_id })));
           }
         } catch (err) {}
       }
@@ -2003,7 +2063,17 @@ export default function App() {
                 </div>:msgs.map((m,i)=>(
                   <div className="message" key={i}>
                     <div className="msgicon">{m.role==='assistant'?<Sparkles size={15}/>:'A'}</div>
-                    <div><small>{m.role==='assistant'?'LAPTOP AI':'YOU'}</small><p>{m.content}</p></div>
+                    <div>
+                      <small>
+                        {m.role==='assistant'?'LAPTOP AI':'YOU'}
+                        {m.queue_request_id && (
+                          <span style={{marginLeft:'8px',background:'rgba(16,185,129,0.15)',border:'1px solid rgba(16,185,129,0.3)',borderRadius:'4px',padding:'1px 5px',fontSize:'10px',color:'#34d399'}}>
+                            Queued #{m.queue_request_id} Completed
+                          </span>
+                        )}
+                      </small>
+                      <p>{m.content}</p>
+                    </div>
                   </div>
                 ))}
                 {busy&&<div className="message"><div className="msgicon"><Sparkles size={15}/></div><div><small>LAPTOP AI</small><p className="muted">{infStatus || 'Thinking…'}</p></div></div>}
@@ -2047,22 +2117,16 @@ export default function App() {
               <div className="panel">
                 <label>RESILIENCE & RATE LIMITS</label>
                 <div style={{display:'flex',alignItems:'center',gap:'8px',margin:'8px 0'}}>
-                  <input
-                    type="checkbox"
-                    id="chat-fallback"
-                    checked={autoFallback}
-                    onChange={e=>toggleAutoFallback(e.target.checked)}
-                    style={{cursor:'pointer'}}
-                  />
-                  <label htmlFor="chat-fallback" style={{fontSize:'10px',cursor:'pointer',fontWeight:600}}>
-                    Auto Fallback on 429
+                  <span style={{background:'#065f46',color:'#6ee7b7',padding:'2px 6px',borderRadius:'4px',fontSize:'9px',fontWeight:700}}>MANDATORY</span>
+                  <label htmlFor="chat-fallback" style={{fontSize:'10px',fontWeight:600,color:'#10b981'}}>
+                    Auto Fallback (Always ON)
                   </label>
                 </div>
                 <small style={{display:'block',color:'#8fa8d6',fontSize:'9px'}}>
-                  Fallback target: {fbProvider.toUpperCase()} ({fbModel})
+                  Active failover chain: Groq ↔ Gemini ↔ OpenRouter
                 </small>
                 <p className="hint" style={{marginTop:'6px',fontSize:'8px'}}>
-                  Automatic token budgeting & bounded backoff protect Groq's 8,000 TPM quota.
+                  Mandatory quota-aware fallback protects conversation continuity on HTTP 429.
                 </p>
               </div>
               <div className="panel">
@@ -2609,54 +2673,295 @@ export default function App() {
               })()}
             </div>
 
+            {/* INFERENCE CONTROL CENTER */}
             <div className="panel" style={{marginTop:'16px'}}>
-              <h3>Rate limit management & intelligent fallback</h3>
-              <small>Protect against provider quotas (e.g. Groq 8,000 TPM limit)</small>
-              <div style={{display:'flex',alignItems:'center',gap:'12px',marginTop:'12px'}}>
-                <input
-                  type="checkbox"
-                  id="auto-fallback-toggle"
-                  checked={autoFallback}
-                  onChange={e=>toggleAutoFallback(e.target.checked)}
-                  style={{width:'16px',height:'16px',cursor:'pointer'}}
-                />
-                <label htmlFor="auto-fallback-toggle" style={{cursor:'pointer',fontSize:'11px',fontWeight:600}}>
-                  Enable Auto Provider Fallback on Rate Limit (HTTP 429)
-                </label>
-              </div>
-              <div style={{marginTop:'10px',display:'grid',gridTemplateColumns:'1fr 1fr',gap:'10px'}}>
+              <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',flexWrap:'wrap',gap:'10px',marginBottom:'12px'}}>
                 <div>
-                  <small style={{fontSize:'10px',color:'#8fa8d6'}}>Fallback Provider</small>
-                  <select
-                    value={fbProvider}
-                    onChange={e=>{
-                      let p = e.target.value;
-                      setFbProvider(p);
-                      let m = p==='gemini'?'gemini-2.5-flash':p==='groq'?'openai/gpt-oss-20b':'openrouter/auto';
-                      setFbModel(m);
-                      req('/settings', {method:'POST', body:JSON.stringify({auto_provider_fallback:autoFallback, fallback_provider:p, fallback_model:m})});
-                    }}
-                    style={{marginTop:'4px'}}
-                  >
-                    <option value="gemini">Google Gemini (Recommended - 1M TPM)</option>
-                    <option value="openrouter">OpenRouter</option>
-                  </select>
+                  <h3 style={{margin:0,display:'flex',alignItems:'center',gap:'6px'}}>
+                    <Cpu size={16} color="#34d399"/> Inference Control Center
+                  </h3>
+                  <small style={{color:'#8fa8d6'}}>
+                    Limit-aware orchestration, real-time quota telemetry, adaptive concurrency, and mandatory failover
+                  </small>
                 </div>
+                <div style={{display:'flex',gap:'8px'}}>
+                  {controlCenter?.queue?.background_paused ? (
+                    <button
+                      className="primary"
+                      style={{fontSize:'11px',padding:'6px 12px',background:'#059669'}}
+                      onClick={resumeBackgroundWork}
+                    >
+                      <Play size={13} style={{marginRight:'4px'}}/> Resume Background Tasks
+                    </button>
+                  ) : (
+                    <button
+                      className="secondary"
+                      style={{fontSize:'11px',padding:'6px 12px'}}
+                      onClick={pauseBackgroundWork}
+                    >
+                      <Pause size={13} style={{marginRight:'4px'}}/> Pause Background Tasks
+                    </button>
+                  )}
+                  <button
+                    className="secondary"
+                    style={{fontSize:'11px',padding:'6px 12px'}}
+                    onClick={refresh}
+                  >
+                    <RefreshCw size={13} style={{marginRight:'4px'}}/> Refresh
+                  </button>
+                </div>
+              </div>
+
+              {/* Mandatory Auto Provider Fallback Policy Banner */}
+              <div style={{background:'#064e3b22',border:'1px solid #05966955',borderRadius:'6px',padding:'10px 14px',display:'flex',alignItems:'center',gap:'12px',marginBottom:'14px'}}>
+                <span style={{background:'#059669',color:'#ecfdf5',padding:'3px 8px',borderRadius:'4px',fontSize:'10px',fontWeight:700}}>
+                  MANDATORY (ALWAYS ON)
+                </span>
                 <div>
-                  <small style={{fontSize:'10px',color:'#8fa8d6'}}>Fallback Model</small>
-                  <input
-                    value={fbModel}
-                    onChange={e=>{
-                      setFbModel(e.target.value);
-                      req('/settings', {method:'POST', body:JSON.stringify({auto_provider_fallback:autoFallback, fallback_provider:fbProvider, fallback_model:e.target.value})});
-                    }}
-                    style={{marginTop:'4px'}}
+                  <b style={{fontSize:'12px',color:'#34d399'}}>Auto Provider Fallback on HTTP 429</b>
+                  <div style={{fontSize:'11px',color:'#a7f3d0',marginTop:'2px'}}>
+                    Permanently enforced runtime policy: When any provider experiences a rate limit (429), LAPTOP AI seamlessly continues using an alternate eligible provider (Groq ↔ Gemini ↔ OpenRouter) without losing conversational context or repeating completed actions.
+                  </div>
+                </div>
+              </div>
+
+              {/* Admission Controller & Concurrency Status */}
+              <div style={{marginBottom:'16px'}}>
+                <label style={{fontSize:'11px',fontWeight:600,color:'#94a3b8',display:'block',marginBottom:'8px'}}>
+                  ADMISSION CONTROLLER & CONCURRENCY LIMITS
+                </label>
+                <div className="stats registry-stats" style={{gridTemplateColumns:'repeat(auto-fit, minmax(140px, 1fr))'}}>
+                  <Stat
+                    label="Gemini Concurrency"
+                    value={`${controlCenter?.queue?.active_requests?.gemini || 0} / ${controlCenter?.queue?.concurrency_limits?.gemini || 4}`}
+                    note="Adaptive concurrency"
+                  />
+                  <Stat
+                    label="Groq Concurrency"
+                    value={`${controlCenter?.queue?.active_requests?.groq || 0} / ${controlCenter?.queue?.concurrency_limits?.groq || 2}`}
+                    note="8,000 TPM limit-aware"
+                  />
+                  <Stat
+                    label="OpenRouter Concurrency"
+                    value={`${controlCenter?.queue?.active_requests?.openrouter || 0} / ${controlCenter?.queue?.concurrency_limits?.openrouter || 2}`}
+                    note="Gateway limit-aware"
+                  />
+                  <Stat
+                    label="Waiting Queue"
+                    value={controlCenter?.queue?.waiting_queue_count || 0}
+                    note={controlCenter?.queue?.background_paused ? "Background paused" : "Requests admitted on quota"}
+                  />
+                  <Stat
+                    label="Background Work"
+                    value={controlCenter?.queue?.background_paused ? "PAUSED" : "ACTIVE"}
+                    note="Interactive chat prioritized"
                   />
                 </div>
               </div>
-              <p className="hint" style={{marginTop:'10px'}}>
-                When enabled, if Groq encounters a 429 rate limit that exceeds retries, LAPTOP AI will seamlessly continue the turn using <strong>{fbProvider.toUpperCase()}</strong> ({fbModel}) without losing context or repeating completed actions.
-              </p>
+
+              {/* Queued Inference Requests Waiting for Quota */}
+              {controlCenter?.queue?.recent_queued && controlCenter.queue.recent_queued.some((q: any) => q.status === 'waiting_quota') && (
+                <div style={{marginBottom:'16px'}}>
+                  <label style={{fontSize:'11px',fontWeight:600,color:'#f59e0b',display:'block',marginBottom:'8px'}}>
+                    QUEUED INFERENCE REQUESTS (WAITING FOR QUOTA)
+                  </label>
+                  <div style={{display:'flex',flexDirection:'column',gap:'6px'}}>
+                    {controlCenter.queue.recent_queued.filter((q: any) => q.status === 'waiting_quota').map((q: any) => (
+                      <div key={q.id} style={{background:'#0c1017',border:'1px solid #78350f',borderRadius:'6px',padding:'6px 12px',display:'flex',justifyContent:'space-between',alignItems:'center',fontSize:'11px'}}>
+                        <div>
+                          <b style={{color:'#fbbf24'}}>{q.id}</b> ({q.priority} priority, ~{q.estimated_tokens || 500} tokens) — {new Date(q.created_at).toLocaleTimeString()}
+                        </div>
+                        <button
+                          className="danger"
+                          style={{fontSize:'10px',padding:'3px 8px'}}
+                          onClick={() => cancelQueuedRequest(q.id)}
+                        >
+                          Cancel
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* Inference Queue History & Results View */}
+              {controlCenter?.queue?.recent_queued && controlCenter.queue.recent_queued.length > 0 && (
+                <div style={{marginBottom:'16px'}}>
+                  <label style={{fontSize:'11px',fontWeight:600,color:'#94a3b8',display:'block',marginBottom:'8px'}}>
+                    INFERENCE QUEUE HISTORY & RESULTS
+                  </label>
+                  <div style={{display:'flex',flexDirection:'column',gap:'6px'}}>
+                    {controlCenter.queue.recent_queued.map((q: any) => (
+                      <div key={q.id} style={{background:'#0c1017',border:'1px solid #1e293b',borderRadius:'6px',padding:'8px 12px',fontSize:'11px'}}>
+                        <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',flexWrap:'wrap',gap:'4px'}}>
+                          <div>
+                            <b style={{color: q.status === 'completed' ? '#10b981' : q.status === 'waiting_quota' ? '#fbbf24' : q.status === 'manual_review' ? '#ef4444' : '#94a3b8'}}>{q.id}</b>
+                            <span style={{marginLeft:'8px',padding:'1px 6px',borderRadius:'4px',fontSize:'10px',background: q.status === 'completed' ? 'rgba(16,185,129,0.15)' : q.status === 'waiting_quota' ? 'rgba(245,158,11,0.15)' : 'rgba(148,163,184,0.15)',color: q.status === 'completed' ? '#34d399' : q.status === 'waiting_quota' ? '#fbbf24' : '#94a3b8'}}>
+                              {q.status.toUpperCase()}
+                            </span>
+                            {q.delivery_status && (
+                              <span style={{marginLeft:'6px',fontSize:'10px',color: q.delivery_status === 'delivered' ? '#34d399' : '#f87171'}}>
+                                • {q.delivery_status}
+                              </span>
+                            )}
+                            {q.conversation_id && (
+                              <span style={{marginLeft:'6px',fontSize:'10px',color:'#64748b'}}>
+                                (Conv #{q.conversation_id})
+                              </span>
+                            )}
+                          </div>
+                          {q.status === 'waiting_quota' && (
+                            <button
+                              className="danger"
+                              style={{fontSize:'10px',padding:'2px 6px'}}
+                              onClick={() => cancelQueuedRequest(q.id)}
+                            >
+                              Cancel
+                            </button>
+                          )}
+                        </div>
+                        {q.result && (
+                          <div style={{marginTop:'6px',color:'#cbd5e1',fontFamily:'monospace',fontSize:'10px',whiteSpace:'pre-wrap',maxHeight:'60px',overflowY:'auto',background:'#070a0f',padding:'4px 8px',borderRadius:'4px',border:'1px solid #1e293b'}}>
+                            {q.result.slice(0, 300)}{q.result.length > 300 ? '...' : ''}
+                          </div>
+                        )}
+                        {q.error_message && (
+                          <div style={{marginTop:'4px',color:'#f87171',fontSize:'10px'}}>
+                            Notice: {q.error_message}
+                          </div>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* Quota & Rate Limit Telemetry per Credential */}
+              <div style={{marginBottom:'16px'}}>
+                <label style={{fontSize:'11px',fontWeight:600,color:'#94a3b8',display:'block',marginBottom:'8px'}}>
+                  CREDENTIAL QUOTA & RATE LIMIT MONITOR (FROM RESPONSE HEADERS)
+                </label>
+                <div style={{display:'flex',flexDirection:'column',gap:'8px'}}>
+                  {credentials.map(c => {
+                    let reqRem = c.requests_remaining !== null && c.requests_remaining !== undefined ? c.requests_remaining : 'Unknown';
+                    let tokRem = c.tokens_remaining !== null && c.tokens_remaining !== undefined ? c.tokens_remaining : 'Unknown';
+                    let qReset = c.quota_reset_at ? new Date(c.quota_reset_at).toLocaleTimeString() : 'Unknown';
+                    let isCooledDown = c.cooldown_until && new Date(c.cooldown_until) > new Date();
+
+                    return (
+                      <div
+                        key={c.id}
+                        style={{
+                          background:'#0c1017',
+                          border:`1px solid ${isCooledDown ? '#b45309' : '#1e293b'}`,
+                          borderRadius:'6px',
+                          padding:'8px 12px',
+                          display:'flex',
+                          justifyContent:'space-between',
+                          alignItems:'center',
+                          flexWrap:'wrap',
+                          gap:'8px'
+                        }}
+                      >
+                        <div style={{display:'flex',alignItems:'center',gap:'8px'}}>
+                          <span style={{
+                            padding:'2px 6px',
+                            borderRadius:'4px',
+                            fontSize:'9px',
+                            fontWeight:700,
+                            background: c.provider === 'gemini' ? '#1e3a8a' : c.provider === 'groq' ? '#78350f' : '#312e81',
+                            color: '#e2e8f0',
+                            textTransform:'uppercase'
+                          }}>
+                            {c.provider}
+                          </span>
+                          <b style={{fontSize:'12px',color:'#e2e8f0'}}>{c.key_name}</b>
+                          <span style={{fontSize:'10px',color:'#94a3b8',fontFamily:'monospace'}}>({c.masked_key})</span>
+                          {c.quota_scope && (
+                            <span style={{fontSize:'9px',color:'#cbd5e1',background:'#1e293b',padding:'2px 6px',borderRadius:'4px'}}>
+                              Scope: {c.quota_scope}
+                            </span>
+                          )}
+                          {isCooledDown && (
+                            <span style={{fontSize:'9px',color:'#fef08a',background:'#854d0e',padding:'2px 6px',borderRadius:'4px',fontWeight:600}}>
+                              COOLDOWN until {new Date(c.cooldown_until).toLocaleTimeString()}
+                            </span>
+                          )}
+                        </div>
+
+                        <div style={{display:'flex',gap:'16px',fontSize:'11px',color:'#94a3b8'}}>
+                          <div>
+                            <span>Req Remaining: </span>
+                            <b style={{color: reqRem === 'Unknown' ? '#64748b' : '#38bdf8'}}>{reqRem}</b>
+                          </div>
+                          <div>
+                            <span>Tokens Remaining: </span>
+                            <b style={{color: tokRem === 'Unknown' ? '#64748b' : '#38bdf8'}}>{tokRem}</b>
+                          </div>
+                          <div>
+                            <span>Reset: </span>
+                            <b style={{color: qReset === 'Unknown' ? '#64748b' : '#a78bfa'}}>{qReset}</b>
+                          </div>
+                          <div>
+                            <span>Daily Req: </span>
+                            <b style={{color:'#e2e8f0'}}>{c.daily_requests_used || 0}</b>
+                          </div>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {/* Automatic Fallback History */}
+              <div>
+                <label style={{fontSize:'11px',fontWeight:600,color:'#94a3b8',display:'block',marginBottom:'8px'}}>
+                  RECENT AUTOMATIC PROVIDER FALLBACK EVENTS
+                </label>
+                {controlCenter?.fallback_monitor?.recent_fallbacks && controlCenter.fallback_monitor.recent_fallbacks.length > 0 ? (
+                  <div style={{overflowX:'auto'}}>
+                    <table style={{width:'100%',fontSize:'11px',borderCollapse:'collapse'}}>
+                      <thead>
+                        <tr style={{borderBottom:'1px solid #1e293b',color:'#64748b',textAlign:'left'}}>
+                          <th style={{padding:'6px'}}>Timestamp</th>
+                          <th style={{padding:'6px'}}>From</th>
+                          <th style={{padding:'6px'}}>To (Fallback)</th>
+                          <th style={{padding:'6px'}}>Reason</th>
+                          <th style={{padding:'6px'}}>Status</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {controlCenter.fallback_monitor.recent_fallbacks.map((f: any) => (
+                          <tr key={f.id} style={{borderBottom:'1px solid #0f172a'}}>
+                            <td style={{padding:'6px',color:'#94a3b8'}}>{new Date(f.created_at).toLocaleTimeString()}</td>
+                            <td style={{padding:'6px',fontWeight:600,color:'#f87171'}}>{f.from_provider} ({f.from_model || 'auto'})</td>
+                            <td style={{padding:'6px',fontWeight:600,color:'#34d399'}}>➜ {f.to_provider} ({f.to_model || 'auto'})</td>
+                            <td style={{padding:'6px',color:'#cbd5e1',maxWidth:'240px',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>
+                              {f.reason}
+                            </td>
+                            <td style={{padding:'6px'}}>
+                              <span style={{
+                                padding:'2px 6px',
+                                borderRadius:'4px',
+                                fontSize:'9px',
+                                fontWeight:700,
+                                background: f.success ? '#065f46' : '#991b1b',
+                                color: f.success ? '#6ee7b7' : '#fca5a5'
+                              }}>
+                                {f.success ? 'RECOVERED' : 'FAILED'}
+                              </span>
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                ) : (
+                  <div style={{padding:'10px',background:'#0c1017',borderRadius:'6px',color:'#64748b',fontSize:'11px',textAlign:'center'}}>
+                    No provider fallback events recorded yet. Inference providers are healthy.
+                  </div>
+                )}
+              </div>
             </div>
           </>}
 

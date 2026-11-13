@@ -1,6 +1,9 @@
 from __future__ import annotations
 import json
+import logging
 from fastapi import APIRouter, HTTPException, Query, Request, Depends, Response
+
+logger = logging.getLogger("laptop_ai.api")
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from dotenv import set_key
@@ -275,8 +278,11 @@ def get_app_settings():
 
 @r.post("/settings")
 def update_app_settings(b: SettingsUpdate):
-    if b.auto_provider_fallback is not None:
-        settings.auto_provider_fallback = b.auto_provider_fallback
+    # Mandatory enforcement: Auto Provider Fallback on HTTP 429 cannot be disabled
+    settings.auto_provider_fallback = True
+    if b.auto_provider_fallback is False:
+        logger.info("Attempt to disable mandatory auto_provider_fallback ignored (policy enforcement).")
+        audit("settings.override", "Attempt to disable mandatory auto_provider_fallback ignored")
     if b.fallback_provider is not None:
         if b.fallback_provider not in ("gemini", "groq", "openrouter"):
             raise HTTPException(400, "Invalid fallback provider. Supported: gemini, groq, openrouter")
@@ -499,6 +505,108 @@ def import_env_provider_credentials():
     return {"ok": True, "result": res}
 
 
+@r.get("/inference/control-center")
+def get_inference_control_center():
+    from app.core.credential_manager import CredentialManager
+    from app.core.inference_orchestrator import circuit_breaker, admission_controller
+    from app.providers.router import status as prov_status
+
+    p_stat = prov_status()
+    cb_stat = circuit_breaker.get_status()
+    health = CredentialManager.get_health_metrics()
+    queue_metrics = admission_controller.get_queue_metrics()
+
+    providers = {}
+    for p in ("gemini", "groq", "openrouter"):
+        pm = health.get("providers", {}).get(p, {})
+        ps = p_stat.get(p, {})
+        cb = cb_stat.get(p, {})
+        state = "online"
+        if not ps.get("configured"):
+            state = "unconfigured"
+        elif cb.get("state") == "open":
+            state = "outage_circuit_open"
+        elif pm.get("cooldown_keys_count", 0) > 0 and pm.get("active_keys_count", 0) == 0:
+            state = "rate_limited"
+        elif pm.get("invalid_keys_count", 0) > 0:
+            state = "degraded"
+
+        providers[p] = {
+            "name": p.capitalize(),
+            "status": state,
+            "configured": ps.get("configured", False),
+            "masked_key": ps.get("masked_key", ""),
+            "circuit_breaker": cb.get("state", "closed"),
+            "latency_p50_ms": pm.get("latency_p50_ms", 0.0),
+            "success_rate_24h": pm.get("success_rate_24h", 100.0),
+            "active_keys": pm.get("active_keys_count", 0),
+            "cooldown_keys": pm.get("cooldown_keys_count", 0),
+            "invalid_keys": pm.get("invalid_keys_count", 0),
+        }
+
+    all_creds = CredentialManager.list_credentials()
+
+    with conn() as c:
+        fb_events = c.execute(
+            """
+            SELECT id, from_provider, to_provider, from_model, to_model, reason, wait_seconds, success, created_at
+            FROM provider_fallback_events
+            ORDER BY created_at DESC
+            LIMIT 15
+            """
+        ).fetchall()
+        recent_telemetry = c.execute(
+            """
+            SELECT id, provider, event_type, model, latency_ms, error_message, created_at
+            FROM provider_telemetry
+            ORDER BY created_at DESC
+            LIMIT 15
+            """
+        ).fetchall()
+
+    return {
+        "ok": True,
+        "current_selection": {
+            "default_provider": settings.default_provider,
+            "default_model": settings.default_model,
+            "fallback_provider": settings.fallback_provider,
+            "fallback_model": settings.fallback_model,
+        },
+        "providers": providers,
+        "credentials": all_creds,
+        "fallback_monitor": {
+            "mandatory_fallback_enabled": True,
+            "policy": "ALWAYS_ON_MANDATORY",
+            "recent_fallbacks": [dict(f) for f in fb_events],
+        },
+        "queue": queue_metrics,
+        "recent_activity": [dict(t) for t in recent_telemetry],
+    }
+
+
+@r.post("/inference/queue/pause-background")
+def pause_background_inference():
+    from app.core.inference_orchestrator import admission_controller
+    admission_controller.pause_background()
+    return {"ok": True, "background_paused": True}
+
+
+@r.post("/inference/queue/resume-background")
+def resume_background_inference():
+    from app.core.inference_orchestrator import admission_controller
+    admission_controller.resume_background()
+    return {"ok": True, "background_paused": False}
+
+
+@r.post("/inference/queue/{request_id}/cancel")
+def cancel_queued_inference_request(request_id: str):
+    from app.core.inference_orchestrator import admission_controller
+    cancelled = admission_controller.cancel_request(request_id, reason="User cancelled queued request")
+    if not cancelled:
+        raise HTTPException(status_code=404, detail="Request not found or not in cancellable state.")
+    return {"ok": True, "request_id": request_id, "status": "cancelled"}
+
+
 @r.post("/chat")
 async def chat(b: Chat):
     if is_emergency_stopped():
@@ -595,7 +703,7 @@ def list_conversations(limit: int = 50):
 def get_conversation_messages(cid: int):
     with conn() as db:
         rows = db.execute(
-            "SELECT id, role, content, created_at FROM messages WHERE conversation_id=? ORDER BY id ASC",
+            "SELECT id, role, content, queue_request_id, created_at FROM messages WHERE conversation_id=? ORDER BY id ASC",
             (cid,),
         ).fetchall()
         return [dict(x) for x in rows]

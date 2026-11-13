@@ -10,7 +10,8 @@ import httpx
 from pydantic import BaseModel
 from app.core.config import settings
 from app.core.security import audit
-from app.core.token_budget import parse_rate_limit_reset, PROVIDER_LIMITS
+from app.core.token_budget import parse_rate_limit_reset, PROVIDER_LIMITS, estimate_tokens
+from app.core.credential_manager import CredentialManager
 
 logger = logging.getLogger("laptop_ai.providers")
 
@@ -135,89 +136,116 @@ async def chat_turn(
         raise ValueError(f"Unsupported provider: '{provider}'")
 
     from app.core.credential_manager import CredentialManager
+    from app.core.inference_orchestrator import admission_controller, circuit_breaker
+
+    est_tokens = estimate_tokens(messages)
+    can_admit, admit_reason = await admission_controller.can_admit(p, estimated_tokens=est_tokens)
+    if not can_admit:
+        raise RateLimitError(provider=p, model=model, wait_seconds=30.0, message=admit_reason)
+
+    await admission_controller.acquire_reservation(p, estimated_tokens=est_tokens)
 
     tried_credential_ids: list[str] = []
     max_key_attempts = 4
 
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        while len(tried_credential_ids) < max_key_attempts:
-            cred_selection = CredentialManager.get_eligible_credential(p, exclude_ids=tried_credential_ids)
-            if not cred_selection:
-                if not tried_credential_ids:
-                    prov_creds = CredentialManager.list_credentials(p)
-                    if prov_creds:
-                        now_iso = datetime.now(timezone.utc).isoformat()
-                        has_cooldown = any(
-                            (c.get("cooldown_until") and c["cooldown_until"] > now_iso) or c.get("status") == "cooldown"
-                            for c in prov_creds
-                        )
-                        if has_cooldown:
-                            raise RateLimitError(
-                                provider=p,
-                                model=model,
-                                wait_seconds=30.0,
-                                message=f"All configured credentials for {provider.capitalize()} are temporarily in cooldown.",
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            while len(tried_credential_ids) < max_key_attempts:
+                cred_selection = CredentialManager.get_eligible_credential(p, exclude_ids=tried_credential_ids)
+                if not cred_selection:
+                    if not tried_credential_ids:
+                        prov_creds = CredentialManager.list_credentials(p)
+                        if prov_creds:
+                            now_iso = datetime.now(timezone.utc).isoformat()
+                            has_cooldown = any(
+                                (c.get("cooldown_until") and c["cooldown_until"] > now_iso) or c.get("status") == "cooldown"
+                                for c in prov_creds
                             )
-                    raise RuntimeError(f"{provider.capitalize()} API key is not configured in backend/.env or credential store.")
-                break
+                            if has_cooldown:
+                                raise RateLimitError(
+                                    provider=p,
+                                    model=model,
+                                    wait_seconds=30.0,
+                                    message=f"All configured credentials for {provider.capitalize()} are temporarily in cooldown.",
+                                )
+                        raise RuntimeError(f"{provider.capitalize()} API key is not configured in backend/.env or credential store.")
+                    break
 
-            cred_id, key = cred_selection
-            t0 = time.perf_counter()
+                cred_id, key = cred_selection
+                t0 = time.perf_counter()
 
-            try:
-                if p == "gemini":
-                    res = await _gemini_turn(client, model, key, messages, tools, system_instruction)
-                else:
-                    res = await _openai_compatible_turn(client, p, model, key, messages, tools, system_instruction)
+                try:
+                    if p == "gemini":
+                        try:
+                            res = await _gemini_turn(client, model, key, messages, tools, system_instruction, cred_id=cred_id)
+                        except TypeError as te:
+                            if "unexpected keyword argument 'cred_id'" in str(te):
+                                res = await _gemini_turn(client, model, key, messages, tools, system_instruction)
+                            else:
+                                raise
+                    else:
+                        try:
+                            res = await _openai_compatible_turn(client, p, model, key, messages, tools, system_instruction, cred_id=cred_id)
+                        except TypeError as te:
+                            if "unexpected keyword argument 'cred_id'" in str(te):
+                                res = await _openai_compatible_turn(client, p, model, key, messages, tools, system_instruction)
+                            else:
+                                raise
 
-                latency_ms = round((time.perf_counter() - t0) * 1000, 2)
-                CredentialManager.record_success(cred_id, model=model, latency_ms=latency_ms)
-                return res
+                    latency_ms = round((time.perf_counter() - t0) * 1000, 2)
+                    CredentialManager.record_success(cred_id, model=model, latency_ms=latency_ms)
+                    await admission_controller.release_reservation(p, estimated_tokens=est_tokens, success=True)
+                    return res
 
-            except AuthError as e:
-                logger.warning("Provider %s key '%s' failed authentication (401). Rotating to next key...", p, cred_id)
-                audit("credential.auth_failed_rotation", f"{p} {cred_id} failed 401, rotating to backup")
-                CredentialManager.record_failure(cred_id, error_code="401", is_auth_failure=True, model=model, error_message=str(e))
-                tried_credential_ids.append(cred_id)
-                continue
-
-            except KeyRateLimitError as e:
-                wait_sec = e.wait_seconds
-                is_shared = e.is_shared_quota
-                logger.warning(
-                    "Provider %s key '%s' rate-limited (429, wait=%.1fs, shared=%s). Evaluating backup keys...",
-                    p, cred_id, wait_sec, is_shared
-                )
-                CredentialManager.record_failure(
-                    cred_id, error_code="429", wait_seconds=wait_sec,
-                    quota_scope_cooldown=is_shared, model=model, error_message=str(e)
-                )
-                tried_credential_ids.append(cred_id)
-
-                # Check if independent backup key exists that is not in cooldown
-                next_cand = CredentialManager.get_eligible_credential(p, exclude_ids=tried_credential_ids)
-                if next_cand and not is_shared:
-                    logger.info("Rotating to backup key '%s' for %s...", next_cand[0], p)
-                    audit("credential.rate_limit_rotation", f"{p} rotated from {cred_id} to {next_cand[0]}")
+                except AuthError as e:
+                    logger.warning("Provider %s key '%s' failed authentication (401). Rotating to next key...", p, cred_id)
+                    audit("credential.auth_failed_rotation", f"{p} {cred_id} failed 401, rotating to backup")
+                    CredentialManager.record_failure(cred_id, error_code="401", is_auth_failure=True, model=model, error_message=str(e))
+                    tried_credential_ids.append(cred_id)
                     continue
-                else:
-                    # No other eligible independent key; raise RateLimitError to trigger provider-level fallback
-                    raise RateLimitError(provider=p, model=model, wait_seconds=wait_sec, message=str(e))
 
-            except ProviderServerError as e:
-                logger.warning("Provider %s key '%s' server error: %s", p, cred_id, e)
-                CredentialManager.record_failure(cred_id, error_code=str(e.status_code), model=model, error_message=str(e))
-                tried_credential_ids.append(cred_id)
-                next_cand = CredentialManager.get_eligible_credential(p, exclude_ids=tried_credential_ids)
-                if next_cand:
-                    continue
-                raise RuntimeError(str(e))
+                except KeyRateLimitError as e:
+                    wait_sec = e.wait_seconds
+                    is_shared = e.is_shared_quota
+                    logger.warning(
+                        "Provider %s key '%s' rate-limited (429, wait=%.1fs, shared=%s). Evaluating backup keys...",
+                        p, cred_id, wait_sec, is_shared
+                    )
+                    CredentialManager.record_failure(
+                        cred_id, error_code="429", wait_seconds=wait_sec,
+                        quota_scope_cooldown=is_shared, model=model, error_message=str(e)
+                    )
+                    tried_credential_ids.append(cred_id)
 
-            except Exception:
-                # Do NOT rotate keys for non-credential errors (e.g. invalid arguments, unsupported model)
-                raise
+                    # Check if independent backup key exists that is not in cooldown
+                    next_cand = CredentialManager.get_eligible_credential(p, exclude_ids=tried_credential_ids)
+                    if next_cand and not is_shared:
+                        logger.info("Rotating to backup key '%s' for %s...", next_cand[0], p)
+                        audit("credential.rate_limit_rotation", f"{p} rotated from {cred_id} to {next_cand[0]}")
+                        continue
+                    else:
+                        await admission_controller.release_reservation(p, estimated_tokens=est_tokens, success=False, is_rate_limit=True)
+                        raise RateLimitError(provider=p, model=model, wait_seconds=wait_sec, message=str(e))
 
-    raise RuntimeError(f"All configured credentials for {provider.capitalize()} were exhausted or unavailable.")
+                except ProviderServerError as e:
+                    logger.warning("Provider %s key '%s' server error: %s", p, cred_id, e)
+                    CredentialManager.record_failure(cred_id, error_code=str(e.status_code), model=model, error_message=str(e))
+                    tried_credential_ids.append(cred_id)
+                    next_cand = CredentialManager.get_eligible_credential(p, exclude_ids=tried_credential_ids)
+                    if next_cand:
+                        continue
+                    await admission_controller.release_reservation(p, estimated_tokens=est_tokens, success=False, error_code=str(e.status_code))
+                    raise RuntimeError(str(e))
+
+                except Exception:
+                    await admission_controller.release_reservation(p, estimated_tokens=est_tokens, success=False)
+                    raise
+
+        raise RuntimeError(f"All configured credentials for {provider.capitalize()} were exhausted or unavailable.")
+    except Exception:
+        # Guarantee reservation release if exception escapes
+        await admission_controller.release_reservation(p, estimated_tokens=est_tokens, success=False)
+        raise
 
 
 async def _openai_compatible_turn(
@@ -228,6 +256,7 @@ async def _openai_compatible_turn(
     messages: list[dict],
     tools: list[dict] | None,
     system_instruction: str,
+    cred_id: str = "",
 ) -> TurnResult:
     url = "https://api.groq.com/openai/v1/chat/completions" if provider == "groq" else "https://openrouter.ai/api/v1/chat/completions"
     headers = {
@@ -302,6 +331,7 @@ async def _openai_compatible_turn(
                 pass
 
             wait_sec = parse_rate_limit_reset(r.headers, r.text)
+            CredentialManager.record_quota_headers(cred_id, r.headers)
             if attempt < max_retries and wait_sec <= 2.0:
                 jitter = random.uniform(0.1, 0.4)
                 actual_sleep = wait_sec + jitter
@@ -338,6 +368,7 @@ async def _openai_compatible_turn(
             raise RuntimeError(f"{provider.capitalize()} API error ({r.status_code}): {err_msg}")
 
         data = r.json()
+        CredentialManager.record_quota_headers(cred_id, r.headers)
         break
 
     if not data or "choices" not in data or not data["choices"]:
@@ -374,6 +405,7 @@ async def _gemini_turn(
     contents: list[dict],
     tools: list[dict] | None,
     system_instruction: str,
+    cred_id: str = "",
 ) -> TurnResult:
     # Use model name directly (e.g. gemini-2.5-flash or gemini-2.0-flash)
     clean_model = model.replace("models/", "")
@@ -434,6 +466,7 @@ async def _gemini_turn(
                 pass
 
             wait_sec = parse_rate_limit_reset(r.headers, r.text)
+            CredentialManager.record_quota_headers(cred_id, r.headers)
             if attempt < max_retries and wait_sec <= 2.0:
                 jitter = random.uniform(0.1, 0.4)
                 actual_sleep = wait_sec + jitter
@@ -470,6 +503,7 @@ async def _gemini_turn(
             raise RuntimeError(f"Gemini API error ({r.status_code}): {err_msg}")
 
         data = r.json()
+        CredentialManager.record_quota_headers(cred_id, r.headers)
         break
 
     if not data:

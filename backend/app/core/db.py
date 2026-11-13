@@ -33,9 +33,15 @@ def init_db():
             conversation_id INTEGER,
             role TEXT,
             content TEXT,
+            queue_request_id TEXT,
             created_at TEXT DEFAULT CURRENT_TIMESTAMP
         );
         """)
+        msg_cursor = c.execute("PRAGMA table_info(messages)")
+        existing_msg_cols = {row["name"] for row in msg_cursor.fetchall()}
+        if "queue_request_id" not in existing_msg_cols:
+            c.execute("ALTER TABLE messages ADD COLUMN queue_request_id TEXT;")
+        c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_queue_req_id ON messages(queue_request_id) WHERE queue_request_id IS NOT NULL;")
         c.execute("""
         CREATE TABLE IF NOT EXISTS approvals(
             id INTEGER PRIMARY KEY,
@@ -88,6 +94,15 @@ def init_db():
             cooldown_until TEXT,
             last_error_code TEXT,
             quota_scope TEXT,
+            requests_remaining INTEGER,
+            requests_limit INTEGER,
+            tokens_remaining INTEGER,
+            tokens_limit INTEGER,
+            cooldown_start TEXT,
+            last_quota_update TEXT,
+            daily_requests_used INTEGER DEFAULT 0,
+            daily_tokens_used INTEGER DEFAULT 0,
+            quota_reset_at TEXT,
             created_at TEXT DEFAULT CURRENT_TIMESTAMP,
             updated_at TEXT DEFAULT CURRENT_TIMESTAMP
         );
@@ -488,3 +503,79 @@ def init_db():
         SET status = 'expired' 
         WHERE status = 'approved' AND executed_at IS NULL AND result IS NULL;
         """)
+
+        # Phase 7: Quota and Header Tracking Migration for provider_credentials
+        cred_cursor = c.execute("PRAGMA table_info(provider_credentials)")
+        existing_cred_cols = {row["name"] for row in cred_cursor.fetchall()}
+        new_cred_cols = {
+            "requests_remaining": "INTEGER",
+            "requests_limit": "INTEGER",
+            "tokens_remaining": "INTEGER",
+            "tokens_limit": "INTEGER",
+            "cooldown_start": "TEXT",
+            "last_quota_update": "TEXT",
+            "daily_requests_used": "INTEGER DEFAULT 0",
+            "daily_tokens_used": "INTEGER DEFAULT 0",
+            "quota_reset_at": "TEXT",
+        }
+        for col, col_type in new_cred_cols.items():
+            if col not in existing_cred_cols:
+                c.execute(f"ALTER TABLE provider_credentials ADD COLUMN {col} {col_type};")
+
+        # Phase 7: Inference Queue and Fallback Events tables
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS inference_queue (
+            id TEXT PRIMARY KEY,
+            conversation_id INTEGER,
+            task_type TEXT NOT NULL,
+            priority TEXT NOT NULL,
+            prompt TEXT NOT NULL,
+            estimated_tokens INTEGER,
+            provider_attempted TEXT,
+            status TEXT NOT NULL,
+            retry_after_ts REAL,
+            claimed_at TEXT,
+            worker_id TEXT,
+            result TEXT,
+            error_message TEXT,
+            checkpoint_data TEXT,
+            retry_count INTEGER DEFAULT 0,
+            delivery_status TEXT DEFAULT 'pending',
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+        """)
+        c.execute("CREATE INDEX IF NOT EXISTS idx_inf_queue_status ON inference_queue(status, priority, created_at);")
+
+        # Migrate existing inference_queue tables
+        q_cursor = c.execute("PRAGMA table_info(inference_queue)")
+        existing_q_cols = {row["name"] for row in q_cursor.fetchall()}
+        new_q_cols = {
+            "claimed_at": "TEXT",
+            "worker_id": "TEXT",
+            "result": "TEXT",
+            "error_message": "TEXT",
+            "checkpoint_data": "TEXT",
+            "retry_count": "INTEGER DEFAULT 0",
+            "delivery_status": "TEXT DEFAULT 'pending'",
+        }
+        for col, col_type in new_q_cols.items():
+            if col not in existing_q_cols:
+                c.execute(f"ALTER TABLE inference_queue ADD COLUMN {col} {col_type};")
+
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS provider_fallback_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            from_provider TEXT NOT NULL,
+            to_provider TEXT NOT NULL,
+            from_model TEXT,
+            to_model TEXT,
+            reason TEXT NOT NULL,
+            credential_id TEXT,
+            quota_scope TEXT,
+            wait_seconds REAL,
+            success INTEGER DEFAULT 1,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+        """)
+        c.execute("CREATE INDEX IF NOT EXISTS idx_fb_events_created ON provider_fallback_events(created_at);")

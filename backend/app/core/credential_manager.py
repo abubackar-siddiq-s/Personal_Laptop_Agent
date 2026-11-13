@@ -288,7 +288,9 @@ class CredentialManager:
                 SELECT id, provider, key_name, key_fingerprint, masked_key, priority,
                        is_primary, enabled, status, last_used_at, last_success_at,
                        last_error_at, consecutive_failures, cooldown_until, last_error_code,
-                       quota_scope, created_at, updated_at
+                       quota_scope, requests_remaining, requests_limit, tokens_remaining,
+                       tokens_limit, cooldown_start, last_quota_update, daily_requests_used,
+                       daily_tokens_used, quota_reset_at, created_at, updated_at
                 FROM provider_credentials
                 WHERE id=?
                 """,
@@ -306,7 +308,9 @@ class CredentialManager:
                 SELECT id, provider, key_name, key_fingerprint, masked_key, priority,
                        is_primary, enabled, status, last_used_at, last_success_at,
                        last_error_at, consecutive_failures, cooldown_until, last_error_code,
-                       quota_scope, created_at, updated_at
+                       quota_scope, requests_remaining, requests_limit, tokens_remaining,
+                       tokens_limit, cooldown_start, last_quota_update, daily_requests_used,
+                       daily_tokens_used, quota_reset_at, created_at, updated_at
                 FROM provider_credentials
             """
             params = []
@@ -524,7 +528,8 @@ class CredentialManager:
             all_rows = c.execute(
                 """
                 SELECT id, key_fingerprint, encrypted_key, is_primary, priority, enabled,
-                       status, consecutive_failures, cooldown_until, quota_scope
+                       status, consecutive_failures, cooldown_until, quota_scope,
+                       requests_remaining, tokens_remaining, quota_reset_at
                 FROM provider_credentials
                 WHERE provider=?
                 ORDER BY is_primary DESC, priority ASC, consecutive_failures ASC, last_used_at ASC
@@ -562,6 +567,16 @@ class CredentialManager:
                 q_scope = row["quota_scope"]
                 if q_scope and q_scope in cooldown_scopes:
                     continue
+
+                # Check known quota limit exhaustion
+                req_rem = row["requests_remaining"]
+                tok_rem = row["tokens_remaining"]
+                q_reset = row["quota_reset_at"]
+                if q_reset and q_reset > now_iso:
+                    if req_rem is not None and req_rem <= 0:
+                        continue
+                    if tok_rem is not None and tok_rem < 50:
+                        continue
 
                 # Candidate found: decrypt via DPAPI internally
                 try:
@@ -708,6 +723,87 @@ class CredentialManager:
             )
 
     @classmethod
+    def record_quota_headers(cls, credential_id: str, headers: Any, tokens_used: int = 0):
+        """
+        Extract provider response headers to track remaining quota and reset windows.
+        Supports standard and provider-specific rate limit headers:
+        - x-ratelimit-remaining-requests, x-ratelimit-limit-requests
+        - x-ratelimit-remaining-tokens, x-ratelimit-limit-tokens
+        - x-ratelimit-reset-requests, x-ratelimit-reset-tokens
+        - retry-after
+        """
+        if not credential_id or credential_id == "env_fallback" or not headers:
+            return
+
+        import re
+
+        def get_h(key: str) -> str | None:
+            if hasattr(headers, "get"):
+                return headers.get(key) or headers.get(key.lower()) or headers.get(key.title())
+            if isinstance(headers, dict):
+                return headers.get(key) or headers.get(key.lower())
+            return None
+
+        req_rem = None
+        req_lim = None
+        tok_rem = None
+        tok_lim = None
+        reset_sec = None
+
+        h_req_rem = get_h("x-ratelimit-remaining-requests")
+        if h_req_rem is not None:
+            try: req_rem = int(h_req_rem)
+            except ValueError: pass
+
+        h_req_lim = get_h("x-ratelimit-limit-requests")
+        if h_req_lim is not None:
+            try: req_lim = int(h_req_lim)
+            except ValueError: pass
+
+        h_tok_rem = get_h("x-ratelimit-remaining-tokens")
+        if h_tok_rem is not None:
+            try: tok_rem = int(h_tok_rem)
+            except ValueError: pass
+
+        h_tok_lim = get_h("x-ratelimit-limit-tokens")
+        if h_tok_lim is not None:
+            try: tok_lim = int(h_tok_lim)
+            except ValueError: pass
+
+        # Check reset header
+        h_reset = get_h("x-ratelimit-reset-tokens") or get_h("x-ratelimit-reset-requests") or get_h("retry-after")
+        if h_reset:
+            m = re.search(r"(\d+(?:\.\d+)?)\s*(s|ms|m|h)?", str(h_reset))
+            if m:
+                val = float(m.group(1))
+                unit = (m.group(2) or "s").lower()
+                if unit == "ms": reset_sec = val / 1000.0
+                elif unit == "m": reset_sec = val * 60.0
+                elif unit == "h": reset_sec = val * 3600.0
+                else: reset_sec = val
+
+        now = datetime.now(timezone.utc)
+        now_iso = now.isoformat()
+        reset_at_iso = (now + timedelta(seconds=reset_sec)).isoformat() if reset_sec else None
+
+        with conn() as c:
+            c.execute(
+                """
+                UPDATE provider_credentials
+                SET requests_remaining = COALESCE(?, requests_remaining),
+                    requests_limit = COALESCE(?, requests_limit),
+                    tokens_remaining = COALESCE(?, tokens_remaining),
+                    tokens_limit = COALESCE(?, tokens_limit),
+                    quota_reset_at = COALESCE(?, quota_reset_at),
+                    last_quota_update = ?,
+                    daily_requests_used = COALESCE(daily_requests_used, 0) + 1,
+                    daily_tokens_used = COALESCE(daily_tokens_used, 0) + ?
+                WHERE id = ?
+                """,
+                (req_rem, req_lim, tok_rem, tok_lim, reset_at_iso, now_iso, max(0, tokens_used), credential_id),
+            )
+
+    @classmethod
     def record_failure(
         cls,
         credential_id: str,
@@ -758,18 +854,19 @@ class CredentialManager:
             elif error_code == "429":
                 new_status = "cooldown"
                 event_type = "rate_limit_429"
-                safe_wait = max(wait_seconds, 2.0)
+                is_daily = any(term in error_message.lower() for term in ("daily", "day limit", "tpd", "rpd", "quota exceeded for day"))
+                safe_wait = max(wait_seconds, 3600.0 if is_daily else 2.0)
                 cd_until = (now + timedelta(seconds=safe_wait)).isoformat()
 
                 # If quota is shared across organization or project, put entire scope into cooldown
-                if (quota_scope_cooldown or quota_scope is not None) and q_scope:
+                if (quota_scope_cooldown or quota_scope is not None or is_daily) and q_scope:
                     c.execute(
                         """
                         UPDATE provider_credentials
-                        SET cooldown_until = ?, status = 'cooldown', updated_at = ?
+                        SET cooldown_until = ?, cooldown_start = ?, status = 'cooldown', updated_at = ?
                         WHERE provider = ? AND quota_scope = ? AND status != 'invalid'
                         """,
-                        (cd_until, now_iso, prov, q_scope),
+                        (cd_until, now_iso, now_iso, prov, q_scope),
                     )
             elif error_code.startswith("5") or "timeout" in error_code.lower():
                 event_type = "error_5xx" if error_code.startswith("5") else "network_timeout"
@@ -788,10 +885,11 @@ class CredentialManager:
                     consecutive_failures = ?,
                     status = ?,
                     cooldown_until = COALESCE(?, cooldown_until),
+                    cooldown_start = CASE WHEN ? IS NOT NULL THEN ? ELSE cooldown_start END,
                     updated_at = ?
                 WHERE id = ?
                 """,
-                (now_iso, now_iso, error_code, curr_fail, new_status, cd_until, now_iso, credential_id),
+                (now_iso, now_iso, error_code, curr_fail, new_status, cd_until, cd_until, now_iso, now_iso, credential_id),
             )
 
             c.execute(

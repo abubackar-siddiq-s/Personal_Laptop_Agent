@@ -25,6 +25,8 @@ app.include_router(r, prefix="/api")
 
 @app.on_event("startup")
 async def start():
+    from app.core.config import settings
+    settings.auto_provider_fallback = True
     init_db()
     get_or_create_bootstrap_secret()
     ApprovalLifecycle.recover_interrupted_executions()
@@ -37,11 +39,16 @@ async def start():
     register_file_tools()
     register_assistant_tools()
     assistant_engine.recover_on_startup()
+    from app.core.inference_orchestrator import inference_dispatcher
+    inference_dispatcher.recover_stale_claims()
     await mcp.load_all_enabled()
     task_scheduler.start()
+    inference_dispatcher.start()
 
 
 @app.on_event("shutdown")
 async def stop():
+    from app.core.inference_orchestrator import inference_dispatcher
+    inference_dispatcher.stop()
     task_scheduler.stop()
     await browser.close()

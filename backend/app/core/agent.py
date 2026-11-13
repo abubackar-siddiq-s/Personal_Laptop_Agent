@@ -149,6 +149,7 @@ class AgentEngine:
         user_message: str,
         conversation_history: list[dict] | None = None,
         conversation_id: int | None = None,
+        checkpoint_executions: list[ToolExecutionRecord] | None = None,
     ) -> AgentResult:
         """
         Run the structured agent loop with preflight token budgeting,
@@ -163,7 +164,7 @@ class AgentEngine:
                 pass
 
         conversation_history = conversation_history or []
-        executions: list[ToolExecutionRecord] = []
+        executions: list[ToolExecutionRecord] = list(checkpoint_executions) if checkpoint_executions else []
 
         active_provider = provider
         active_model = model
@@ -205,13 +206,33 @@ class AgentEngine:
             return res
 
         except RateLimitError as e:
-            # 2. Rate Limit Handling: Check if auto-fallback is enabled in settings
+            # Mandatory Auto Provider Fallback (Always enabled)
             if settings.auto_provider_fallback:
-                fb_provider = settings.fallback_provider
-                fb_model = settings.fallback_model
-                fb_key = get_key(fb_provider)
+                from app.core.inference_orchestrator import (
+                    ProviderSelector,
+                    record_fallback_event,
+                    circuit_breaker,
+                    admission_controller,
+                )
 
-                if fb_key and fb_provider != active_provider:
+                candidates = ProviderSelector.get_fallback_order(active_provider)
+                if settings.fallback_provider in candidates:
+                    candidates.remove(settings.fallback_provider)
+                    candidates.insert(0, settings.fallback_provider)
+
+                for fb_provider in candidates:
+                    fb_key = get_key(fb_provider)
+                    if not fb_key:
+                        continue
+
+                    # Select model: OpenRouter strictly free/auto model
+                    if fb_provider == "gemini":
+                        fb_model = settings.fallback_model or "gemini-2.5-flash"
+                    elif fb_provider == "groq":
+                        fb_model = "openai/gpt-oss-20b"
+                    else:
+                        fb_model = "openrouter/auto"
+
                     logger.warning(
                         "Auto provider fallback triggered: %s (%s) rate-limited -> switching to %s (%s)",
                         active_provider, active_model, fb_provider, fb_model
@@ -242,42 +263,42 @@ class AgentEngine:
                         res.model_used = fb_model
                         res.fallback_occurred = True
                         res.fallback_from = active_provider
+                        record_fallback_event(
+                            from_provider=active_provider,
+                            to_provider=fb_provider,
+                            from_model=active_model,
+                            to_model=fb_model,
+                            reason=str(e),
+                            success=True,
+                        )
                         notice = (
                             f"\n\n*(⚡ Switched to **{fb_provider.capitalize()}** (`{fb_model}`) fallback: "
                             f"{active_provider.capitalize()} reached its rate limit.)*"
                         )
                         res.reply = res.reply.strip() + notice
                         return res
-                    except Exception as fb_err:
-                        logger.error("Primary fallback provider %s failed: %s", fb_provider, fb_err)
-                        # Secondary fallback to OpenRouter if configured
-                        or_key = get_key("openrouter")
-                        if or_key and fb_provider != "openrouter" and active_provider != "openrouter":
-                            logger.info("Attempting secondary fallback to OpenRouter...")
-                            try:
-                                res = await self._run_openai_loop(
-                                    provider="openrouter",
-                                    model="openrouter/auto",
-                                    user_message=user_message,
-                                    history=compacted_history,
-                                    executions=executions,
-                                    conversation_id=conversation_id,
-                                    system_prompt=active_system_prompt,
-                                )
-                                res.provider_used = "openrouter"
-                                res.model_used = "openrouter/auto"
-                                res.fallback_occurred = True
-                                res.fallback_from = active_provider
-                                notice = (
-                                    f"\n\n*(⚡ Switched to **OpenRouter** (`openrouter/auto`) fallback: "
-                                    f"{active_provider.capitalize()} was rate-limited.)*"
-                                )
-                                res.reply = res.reply.strip() + notice
-                                return res
-                            except Exception as fb2_err:
-                                logger.error("Secondary fallback to OpenRouter failed: %s", fb2_err)
 
-            # 3. Fallback disabled or fallback failed: craft clear, non-destructive user notification
+                    except Exception as fb_err:
+                        logger.error("Fallback provider %s failed: %s", fb_provider, fb_err)
+                        record_fallback_event(
+                            from_provider=active_provider,
+                            to_provider=fb_provider,
+                            from_model=active_model,
+                            to_model=fb_model,
+                            reason=str(fb_err),
+                            success=False,
+                        )
+                        continue
+
+            # 3. All configured providers failed or exhausted: Enqueue safely
+            from app.core.inference_orchestrator import admission_controller
+            q_id = admission_controller.queue_request(
+                conversation_id,
+                user_message,
+                priority="chat",
+                provider_attempted=active_provider,
+                checkpoint_data=[e.__dict__ for e in executions] if executions else None,
+            )
             state_report = ""
             if executions:
                 state_report = "\n\n**Actions Completed Before Rate Limit:**\n" + "\n".join(
@@ -288,9 +309,10 @@ class AgentEngine:
             reply = (
                 f"⚠️ **{active_provider.capitalize()} Rate Limit Reached (HTTP 429)**\n\n"
                 f"The 8,000 tokens-per-minute quota for `{active_model}` was temporarily reached. "
-                f"Please wait ~{int(e.wait_seconds + 1)}s before continuing."
-                f"{state_report}\n\n"
-                f"*Tip: You can enable 'Auto Provider Fallback' in dashboard settings to automatically continue with Google Gemini when Groq is rate-limited.*"
+                f"Please wait ~{int(e.wait_seconds + 1)}s before continuing.\n\n"
+                f"All backup providers were evaluated, and the request has been safely queued (#{q_id}) to resume automatically. "
+                f"Auto Provider Fallback was engaged and evaluated all eligible providers. "
+                f"Conversation context and completed actions remain fully preserved.{state_report}"
             )
             return AgentResult(
                 reply=reply,
@@ -300,6 +322,9 @@ class AgentEngine:
                 model_used=active_model,
                 fallback_occurred=False,
             )
+
+    # Alias step to run for single-step/turn agent invocation
+    step = run
 
     async def _execute_tool_call(
         self,
@@ -395,17 +420,35 @@ class AgentEngine:
                 ),
             }, rec
 
+        # Check read-only deterministic cache if low risk
+        if spec.risk == "low":
+            from app.core.inference_orchestrator import read_only_cache
+            cached_val = read_only_cache.get(reg_name, args)
+            if cached_val is not None:
+                rec = ToolExecutionRecord(
+                    tool_name=reg_name,
+                    arguments=args,
+                    success=True,
+                    result=cached_val,
+                )
+                return cached_val, rec
+
         # Execute read-safe or pre-approved tool
         exec_res = await registry.execute(reg_name, args, timeout=self.tool_timeout)
         if exec_res.get("success"):
             audit("tool.executed", f"{reg_name}: {json.dumps(args)}")
+            res_val = exec_res.get("result")
+            if spec.risk == "low":
+                from app.core.inference_orchestrator import read_only_cache
+                read_only_cache.set(reg_name, args, res_val)
+
             rec = ToolExecutionRecord(
                 tool_name=reg_name,
                 arguments=args,
                 success=True,
-                result=exec_res.get("result"),
+                result=res_val,
             )
-            return exec_res.get("result"), rec
+            return res_val, rec
         else:
             audit("tool.failed", f"{reg_name}: {exec_res.get('error')}")
             rec = ToolExecutionRecord(
