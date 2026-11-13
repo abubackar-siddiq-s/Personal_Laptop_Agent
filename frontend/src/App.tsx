@@ -5,7 +5,8 @@ import {
   RefreshCw,Check,X,Server,PanelLeftClose,Zap,Clock3,ArrowUpRight,ArrowLeft,ArrowRight,
   RotateCw,Camera,Download,ExternalLink,Trash2,Shield,Eye,Bell,User,
   AlertTriangle,Play,Pause,Calendar,Brain,Edit2,Archive,Repeat,StopCircle,
-  Monitor,MousePointer,Keyboard,FileText,Table,Filter,Copy,FileCheck,Files,Lock
+  Monitor,MousePointer,Keyboard,FileText,Table,Filter,Copy,FileCheck,Files,Lock,
+  Key,Star,ArrowUp,ArrowDown,CheckCircle,XCircle
 } from 'lucide-react';
 
 const API = 'http://127.0.0.1:8000/api';
@@ -199,6 +200,23 @@ export default function App() {
   let [manualBootstrapKey, setManualBootstrapKey] = useState<string>('');
   let [authError, setAuthError] = useState<string>('');
 
+  // Multi-Key Credential Management State
+  const [credentials, setCredentials] = useState<any[]>([]);
+  const [credHealth, setCredHealth] = useState<any>({});
+  const [showAddKeyModal, setShowAddKeyModal] = useState<boolean>(false);
+  const [showKeyVal, setShowKeyVal] = useState<boolean>(false);
+  const [newKeyProvider, setNewKeyProvider] = useState<string>('gemini');
+  const [newKeyName, setNewKeyName] = useState<string>('');
+  const [newKeyVal, setNewKeyVal] = useState<string>('');
+  const [newKeyPriority, setNewKeyPriority] = useState<number>(100);
+  const [newKeyIsPrimary, setNewKeyIsPrimary] = useState<boolean>(false);
+  const [newKeyQuotaScope, setNewKeyQuotaScope] = useState<string>('');
+  const [testingCredId, setTestingCredId] = useState<string | null>(null);
+  const [testingRaw, setTestingRaw] = useState<boolean>(false);
+  const [rawTestResult, setRawTestResult] = useState<any>(null);
+  const [credTestResults, setCredTestResults] = useState<Record<string, any>>({});
+  const [filterCredProvider, setFilterCredProvider] = useState<string>('all');
+
   async function authorizeWithKey(keyToTry?: string): Promise<string> {
     setAuthError('');
     let bToken = (keyToTry !== undefined ? keyToTry : manualBootstrapKey || '').trim();
@@ -298,10 +316,14 @@ export default function App() {
 
   async function refresh() {
     try {
-      let[t,s,v,a,q,y,stg,emg] = await Promise.all([
-        req('/tools'),req('/mcp/servers'),req('/providers'),req('/audit'),req('/approvals'),req('/system'),req('/settings'),req('/emergency/status')
+      let[t,s,v,a,q,y,stg,emg,credsRes,healthRes] = await Promise.all([
+        req('/tools'),req('/mcp/servers'),req('/providers'),req('/audit'),req('/approvals'),req('/system'),req('/settings'),req('/emergency/status'),
+        req('/providers/credentials').catch(()=>({credentials:[]})),
+        req('/providers/credentials/health').catch(()=>({metrics:{}}))
       ]);
       T(t);S(s);V(v);A(a);Q(q);Y(y);
+      if (credsRes?.credentials) setCredentials(credsRes.credentials);
+      if (healthRes?.metrics) setCredHealth(healthRes.metrics);
       if (emg) setEmergency(emg);
       if (stg) {
         setAutoFallback(Boolean(stg.auto_provider_fallback));
@@ -340,6 +362,173 @@ export default function App() {
       }
     } catch(e:any) {
       Z(e.message);
+    }
+  }
+
+  // Multi-Key Credential Management Actions
+  async function loadCredentials() {
+    try {
+      let [resCreds, resHealth] = await Promise.all([
+        req('/providers/credentials'),
+        req('/providers/credentials/health')
+      ]);
+      if (resCreds?.credentials) setCredentials(resCreds.credentials);
+      if (resHealth?.metrics) setCredHealth(resHealth.metrics);
+    } catch (_) {}
+  }
+
+  async function handleAddCredential() {
+    let cleanKey = newKeyVal.trim();
+    if (!cleanKey || cleanKey.length < 8) {
+      Z('Please enter a valid API key (at least 8 characters).');
+      return;
+    }
+    try {
+      await req('/providers/credentials', {
+        method: 'POST',
+        body: JSON.stringify({
+          provider: newKeyProvider,
+          key_name: newKeyName.trim() || `${newKeyProvider.toUpperCase()} Key`,
+          api_key: cleanKey,
+          priority: Number(newKeyPriority) || 100,
+          is_primary: Boolean(newKeyIsPrimary),
+          quota_scope: newKeyQuotaScope.trim() || null,
+        }),
+      });
+      setNewKeyVal('');
+      setNewKeyName('');
+      setNewKeyQuotaScope('');
+      setNewKeyIsPrimary(false);
+      setRawTestResult(null);
+      setShowAddKeyModal(false);
+      Z('API key added and securely encrypted via Windows DPAPI.');
+      await refresh();
+      await loadCredentials();
+    } catch (e: any) {
+      Z(`Failed to add key: ${e.message}`);
+    }
+  }
+
+  async function handleTestRawKey() {
+    let cleanKey = newKeyVal.trim();
+    if (!cleanKey || cleanKey.length < 8) {
+      Z('Please enter a key to test.');
+      return;
+    }
+    setTestingRaw(true);
+    setRawTestResult(null);
+    try {
+      let res = await req('/providers/credentials/test-raw', {
+        method: 'POST',
+        body: JSON.stringify({ provider: newKeyProvider, api_key: cleanKey }),
+      });
+      setRawTestResult(res);
+      if (res.ok) {
+        Z(`Verification succeeded (${res.latency_ms} ms). Key is valid.`);
+      } else {
+        Z(`Verification failed: ${res.error || 'Authentication error'}`);
+      }
+    } catch (e: any) {
+      setRawTestResult({ ok: false, error: e.message });
+      Z(`Test error: ${e.message}`);
+    } finally {
+      setTestingRaw(false);
+    }
+  }
+
+  async function handleTestCredential(id: string) {
+    setTestingCredId(id);
+    try {
+      let res = await req(`/providers/credentials/${id}/test`, { method: 'POST' });
+      setCredTestResults(prev => ({ ...prev, [id]: res }));
+      if (res.ok) {
+        Z(`Connection valid! Latency: ${res.latency_ms} ms`);
+      } else {
+        Z(`Connection test failed: ${res.error || 'Provider rejected key'}`);
+      }
+      await loadCredentials();
+    } catch (e: any) {
+      Z(`Test failed: ${e.message}`);
+    } finally {
+      setTestingCredId(null);
+    }
+  }
+
+  async function handleSetPrimary(id: string) {
+    try {
+      await req(`/providers/credentials/${id}/set-primary`, { method: 'POST' });
+      Z('Primary key updated.');
+      await refresh();
+      await loadCredentials();
+    } catch (e: any) {
+      Z(`Failed to set primary: ${e.message}`);
+    }
+  }
+
+  async function handleToggleEnable(id: string, currentlyEnabled: boolean) {
+    try {
+      let action = currentlyEnabled ? 'disable' : 'enable';
+      await req(`/providers/credentials/${id}/${action}`, { method: 'POST' });
+      Z(`Credential ${currentlyEnabled ? 'disabled' : 'enabled'}.`);
+      await refresh();
+      await loadCredentials();
+    } catch (e: any) {
+      Z(`Failed to update status: ${e.message}`);
+    }
+  }
+
+  async function handleDeleteCredential(id: string, keyName: string, isPrimary: boolean) {
+    let msg = isPrimary
+      ? `"${keyName}" is the PRIMARY key. Deleting it will promote the next highest priority backup key. Are you sure?`
+      : `Delete credential "${keyName}"?`;
+    if (!window.confirm(msg)) return;
+    try {
+      await req(`/providers/credentials/${id}`, { method: 'DELETE' });
+      Z(`Credential "${keyName}" deleted.`);
+      await refresh();
+      await loadCredentials();
+    } catch (e: any) {
+      Z(`Failed to delete credential: ${e.message}`);
+    }
+  }
+
+  async function handleMovePriority(provider: string, id: string, direction: 'up' | 'down') {
+    let provCreds = credentials.filter(c => c.provider === provider).sort((a, b) => a.priority - b.priority);
+    let idx = provCreds.findIndex(c => c.id === id);
+    if (idx === -1) return;
+    if (direction === 'up' && idx === 0) return;
+    if (direction === 'down' && idx === provCreds.length - 1) return;
+
+    let targetIdx = direction === 'up' ? idx - 1 : idx + 1;
+    let temp = provCreds[idx];
+    provCreds[idx] = provCreds[targetIdx];
+    provCreds[targetIdx] = temp;
+
+    let orderedIds = provCreds.map(c => c.id);
+    try {
+      await req('/providers/credentials/reorder', {
+        method: 'POST',
+        body: JSON.stringify({ provider, ordered_ids: orderedIds })
+      });
+      await loadCredentials();
+    } catch (e: any) {
+      Z(`Failed to reorder: ${e.message}`);
+    }
+  }
+
+  async function handleImportFromEnv() {
+    try {
+      let res = await req('/providers/credentials/import-env', { method: 'POST' });
+      let count = res.result?.imported?.length || 0;
+      if (count > 0) {
+        Z(`Imported ${count} key(s) from .env into secure DPAPI storage.`);
+      } else {
+        Z('No unimported environment keys found.');
+      }
+      await refresh();
+      await loadCredentials();
+    } catch (e: any) {
+      Z(`Import failed: ${e.message}`);
     }
   }
 
@@ -1582,6 +1771,152 @@ export default function App() {
           </div>
         )}
 
+        {showAddKeyModal && (
+          <div className="modal-backdrop">
+            <div className="modal-box" style={{maxWidth:'480px'}}>
+              <div className="modal-header">
+                <Key size={20} color="#a855f7" />
+                <h3>Add Provider API Key</h3>
+              </div>
+              <p style={{marginBottom:'14px'}}>
+                Stored locally with <strong>Windows DPAPI CurrentUser encryption</strong>. Plaintext keys are never stored on disk or returned in API responses.
+              </p>
+
+              <div style={{display:'flex',flexDirection:'column',gap:'10px',marginBottom:'16px'}}>
+                <div>
+                  <label style={{fontSize:'10px',color:'#8fa8d6',display:'block',marginBottom:'4px',fontWeight:600}}>PROVIDER</label>
+                  <select
+                    value={newKeyProvider}
+                    onChange={e => setNewKeyProvider(e.target.value)}
+                    style={{width:'100%',padding:'6px 10px',background:'#0c1017',border:'1px solid #2a3547',borderRadius:'6px',color:'#e1e7f2'}}
+                  >
+                    <option value="gemini">Google Gemini</option>
+                    <option value="groq">Groq</option>
+                    <option value="openrouter">OpenRouter</option>
+                  </select>
+                </div>
+
+                <div>
+                  <label style={{fontSize:'10px',color:'#8fa8d6',display:'block',marginBottom:'4px',fontWeight:600}}>KEY LABEL / NAME</label>
+                  <input
+                    type="text"
+                    value={newKeyName}
+                    onChange={e => setNewKeyName(e.target.value)}
+                    placeholder={newKeyProvider === 'gemini' ? 'e.g. Gemini 2.5 Flash Primary' : newKeyProvider === 'groq' ? 'e.g. Groq Backup 2' : 'e.g. OpenRouter Personal'}
+                    style={{width:'100%',padding:'6px 10px',background:'#0c1017',border:'1px solid #2a3547',borderRadius:'6px',color:'#e1e7f2'}}
+                  />
+                </div>
+
+                <div>
+                  <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:'4px'}}>
+                    <label style={{fontSize:'10px',color:'#8fa8d6',fontWeight:600}}>API KEY SECRET</label>
+                    <button
+                      type="button"
+                      onClick={() => setShowKeyVal(!showKeyVal)}
+                      style={{background:'transparent',border:0,color:'#9fb1ca',fontSize:'10px',cursor:'pointer',padding:0}}
+                    >
+                      {showKeyVal ? 'Hide Secret' : 'Show Secret'}
+                    </button>
+                  </div>
+                  <input
+                    type={showKeyVal ? 'text' : 'password'}
+                    value={newKeyVal}
+                    onChange={e => setNewKeyVal(e.target.value)}
+                    placeholder="Paste provider key securely..."
+                    style={{width:'100%',padding:'6px 10px',background:'#0c1017',border:'1px solid #2a3547',borderRadius:'6px',color:'#e1e7f2',fontFamily:'monospace'}}
+                  />
+                </div>
+
+                <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:'10px'}}>
+                  <div>
+                    <label style={{fontSize:'10px',color:'#8fa8d6',display:'block',marginBottom:'4px',fontWeight:600}}>ROTATION PRIORITY</label>
+                    <input
+                      type="number"
+                      value={newKeyPriority}
+                      onChange={e => setNewKeyPriority(Number(e.target.value))}
+                      placeholder="100"
+                      min="1"
+                      max="1000"
+                      style={{width:'100%',padding:'6px 10px',background:'#0c1017',border:'1px solid #2a3547',borderRadius:'6px',color:'#e1e7f2'}}
+                    />
+                    <small style={{fontSize:'9px',color:'#6b7280'}}>Lower priority numbers run first</small>
+                  </div>
+
+                  <div>
+                    <label style={{fontSize:'10px',color:'#8fa8d6',display:'block',marginBottom:'4px',fontWeight:600}}>QUOTA SCOPE (OPTIONAL)</label>
+                    <input
+                      type="text"
+                      value={newKeyQuotaScope}
+                      onChange={e => setNewKeyQuotaScope(e.target.value)}
+                      placeholder="e.g. team-acct-1"
+                      style={{width:'100%',padding:'6px 10px',background:'#0c1017',border:'1px solid #2a3547',borderRadius:'6px',color:'#e1e7f2'}}
+                    />
+                    <small style={{fontSize:'9px',color:'#6b7280'}}>Shared cooldown tag</small>
+                  </div>
+                </div>
+
+                <div style={{display:'flex',alignItems:'center',gap:'8px',marginTop:'4px'}}>
+                  <input
+                    type="checkbox"
+                    id="new-key-primary-toggle"
+                    checked={newKeyIsPrimary}
+                    onChange={e => setNewKeyIsPrimary(e.target.checked)}
+                    style={{cursor:'pointer'}}
+                  />
+                  <label htmlFor="new-key-primary-toggle" style={{fontSize:'11px',color:'#e1e7f2',cursor:'pointer',fontWeight:500}}>
+                    Set as Primary Key for {newKeyProvider.toUpperCase()}
+                  </label>
+                </div>
+
+                {rawTestResult && (
+                  <div style={{
+                    padding:'8px 10px',
+                    borderRadius:'6px',
+                    fontSize:'11px',
+                    background: rawTestResult.ok ? '#14291f' : '#2d1418',
+                    border: rawTestResult.ok ? '1px solid #22c55e' : '1px solid #ef4444',
+                    color: rawTestResult.ok ? '#86efac' : '#fca5a5'
+                  }}>
+                    {rawTestResult.ok
+                      ? `Connection Verified (${rawTestResult.latency_ms} ms). Key is authentic.`
+                      : `Verification Failed: ${rawTestResult.error || 'Authentication error'}`}
+                  </div>
+                )}
+              </div>
+
+              <div className="modal-actions" style={{display:'flex',justifyContent:'space-between',alignItems:'center'}}>
+                <button
+                  type="button"
+                  className="secondary"
+                  onClick={handleTestRawKey}
+                  disabled={testingRaw || !newKeyVal.trim()}
+                  style={{fontSize:'11px',padding:'6px 12px'}}
+                >
+                  <Zap size={12} style={{marginRight:'4px'}}/>
+                  {testingRaw ? 'Testing...' : 'Test Connection'}
+                </button>
+                <div style={{display:'flex',gap:'8px'}}>
+                  <button
+                    type="button"
+                    className="ghost"
+                    onClick={() => { setShowAddKeyModal(false); setRawTestResult(null); }}
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="button"
+                    className="primary"
+                    disabled={!newKeyVal.trim()}
+                    onClick={handleAddCredential}
+                  >
+                    <Lock size={12} style={{marginRight:'4px'}}/> Save & Encrypt
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
         {bootstrapRequired && !localSessionToken && (
           <div style={{background:'#1e1528',border:'1px solid #7c3aed',borderRadius:8,padding:'12px 16px',margin:'10px 20px',display:'flex',alignItems:'center',justifyContent:'space-between',gap:12}}>
             <div style={{display:'flex',alignItems:'center',gap:10}}>
@@ -1933,40 +2268,345 @@ export default function App() {
           </>}
 
           {(page==='Models'||page==='Settings')&&<>
-            <Heading tag="AI CONFIGURATION" title="Models & providers" desc="Configure cloud inference. Credentials are saved by the local backend."/>
+            <Heading tag="AI INFRASTRUCTURE" title="Models & Credentials" desc="Multi-key API backup, automatic rotation, DPAPI encryption at rest, and intelligent failover." action={<button className="secondary" onClick={()=>{refresh();loadCredentials();}}><RefreshCw size={14}/> Refresh status</button>}/>
             <div className="providers">
-              {['gemini','groq','openrouter'].map(x=>(
-                <div className="panel" key={x}>
-                  <div className="providerline">
-                    <div className={'providerlogo '+x}>{x==='gemini'?'✦':x==='groq'?'G':'◈'}</div>
-                    <span>{providers[x]?.configured?'● CONFIGURED':'○ NOT CONNECTED'}</span>
+              {['gemini','groq','openrouter'].map(x => {
+                let provCreds = credentials.filter(c => c.provider === x);
+                let primaryCred = provCreds.find(c => c.is_primary);
+                let activeCount = provCreds.filter(c => c.enabled && c.status === 'active').length;
+                let isConfigured = Boolean(providers[x]?.configured || primaryCred || provCreds.length > 0);
+                let provHealth = credHealth?.providers?.[x];
+
+                return (
+                  <div className="panel" key={x}>
+                    <div className="providerline">
+                      <div className={'providerlogo ' + x}>{x === 'gemini' ? '✦' : x === 'groq' ? 'G' : '◈'}</div>
+                      <span style={{color: isConfigured ? '#34d399' : '#9ca3af', fontWeight: 600}}>
+                        {isConfigured ? '● CONFIGURED' : '○ NOT CONNECTED'}
+                      </span>
+                    </div>
+                    <h3>{x === 'gemini' ? 'Google Gemini' : x === 'groq' ? 'Groq' : 'OpenRouter'}</h3>
+                    <small>{x === 'gemini' ? 'Generative models API' : x === 'groq' ? 'GroqCloud inference' : 'Multi-model gateway'}</small>
+                    <code>{x === 'gemini' ? 'gemini-2.5-flash' : x === 'groq' ? 'openai/gpt-oss-20b' : 'openrouter/auto'}</code>
+
+                    <div style={{marginTop:'10px',paddingTop:'10px',borderTop:'1px solid #1f2733',fontSize:'11px',display:'flex',flexDirection:'column',gap:'4px'}}>
+                      <div style={{display:'flex',justifyContent:'space-between',color:'#9ca3af'}}>
+                        <span>Keys:</span>
+                        <b style={{color:'#e1e7f2'}}>{provCreds.length} ({activeCount} active)</b>
+                      </div>
+                      <div style={{display:'flex',justifyContent:'space-between',color:'#9ca3af'}}>
+                        <span>Primary:</span>
+                        <b style={{color: primaryCred ? '#6ee7b7' : '#9ca3af', fontFamily:'monospace', fontSize:'10px'}}>
+                          {primaryCred ? primaryCred.masked_key : (providers[x]?.masked_key || 'None')}
+                        </b>
+                      </div>
+                      {provHealth && (
+                        <div style={{display:'flex',justifyContent:'space-between',color:'#9ca3af'}}>
+                          <span>Status:</span>
+                          <span style={{
+                            color: provHealth.status === 'active' ? '#34d399' : provHealth.status === 'cooldown' ? '#fbbf24' : '#f87171',
+                            fontWeight: 600,
+                            textTransform: 'capitalize'
+                          }}>
+                            {provHealth.status}
+                          </span>
+                        </div>
+                      )}
+                    </div>
+
+                    <div style={{display:'flex',gap:'6px',marginTop:'12px'}}>
+                      <button
+                        className="secondary"
+                        style={{flex:1,fontSize:'11px',padding:'6px 8px'}}
+                        onClick={() => {
+                          setFilterCredProvider(x);
+                        }}
+                      >
+                        Filter Keys
+                      </button>
+                      <button
+                        className="primary"
+                        style={{fontSize:'11px',padding:'6px 10px'}}
+                        onClick={() => {
+                          setNewKeyProvider(x);
+                          setNewKeyName(`${x.toUpperCase()} Backup`);
+                          setShowAddKeyModal(true);
+                        }}
+                        title="Add API Key"
+                      >
+                        <Plus size={13}/> Add Key
+                      </button>
+                    </div>
                   </div>
-                  <h3>{x==='gemini'?'Google Gemini':x==='groq'?'Groq':'OpenRouter'}</h3>
-                  <small>{x==='gemini'?'Generative models API':x==='groq'?'GroqCloud inference':'Multi-model gateway'}</small>
-                  <code>{x==='gemini'?'gemini-2.5-flash':x==='groq'?'openai/gpt-oss-20b':'openrouter/auto'}</code>
-                  <button className="secondary full" onClick={()=>Kp(x)}>Configure provider</button>
-                </div>
-              ))}
+                );
+              })}
             </div>
-            <div className="panel keypanel">
-              <h3>API credentials</h3>
-              <small>Keys are stored in backend/.env. Restart backend after saving.</small>
-              <div className="keyform">
-                <div>
-                  <label>Provider</label>
-                  <select value={kp} onChange={e=>Kp(e.target.value)}>
-                    <option value="gemini">Gemini</option>
-                    <option value="groq">Groq</option>
-                    <option value="openrouter">OpenRouter</option>
-                  </select>
+
+            {/* Provider Health & Rotation Telemetry Dashboard */}
+            {credHealth?.summary && (
+              <div className="panel" style={{marginTop:'16px'}}>
+                <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:'8px'}}>
+                  <h3 style={{margin:0,display:'flex',alignItems:'center',gap:'6px'}}>
+                    <Activity size={16} color="#60a5fa"/> Provider Health & Telemetry
+                  </h3>
+                  <span style={{fontSize:'11px',color:'#8fa8d6'}}>
+                    {credHealth.summary.total_credentials} credentials managed · {credHealth.summary.active_credentials} active
+                  </span>
                 </div>
-                <div>
-                  <label>API key</label>
-                  <input type="password" value={key} onChange={e=>K(e.target.value)} placeholder="Paste provider key locally"/>
+                <div className="stats registry-stats" style={{marginTop:'10px'}}>
+                  <Stat label="Total requests" value={credHealth.summary.total_requests || 0} />
+                  <Stat label="Success rate" value={`${credHealth.summary.success_rate_percent || 100}%`} note={`${credHealth.summary.total_successes || 0} successful`} />
+                  <Stat label="Rate limits (429)" value={credHealth.summary.total_rate_limits || 0} note="Auto-rotates to backup" />
+                  <Stat label="Auth failures (401)" value={credHealth.summary.total_auth_failures || 0} note="Auto-invalidates key" />
+                  <Stat label="Server errors (5xx)" value={credHealth.summary.total_server_errors || 0} note="Bounded backoff" />
                 </div>
-                <button className="primary" disabled={!key} onClick={save}>Save key <Check size={14}/></button>
               </div>
-              <p className="hint"><ShieldCheck size={13}/> Never paste API keys into chat.</p>
+            )}
+
+            {/* Multi-Key Credential Vault */}
+            <div className="panel" style={{marginTop:'16px'}}>
+              <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',flexWrap:'wrap',gap:'10px',marginBottom:'12px'}}>
+                <div>
+                  <h3 style={{margin:0,display:'flex',alignItems:'center',gap:'6px'}}>
+                    <Key size={16} color="#a855f7"/> Multi-Key Credential Vault
+                  </h3>
+                  <small style={{color:'#8fa8d6'}}>
+                    Zero-plaintext storage encrypted at rest with Windows DPAPI (CurrentUser)
+                  </small>
+                </div>
+                <div style={{display:'flex',gap:'8px'}}>
+                  <button
+                    className="secondary"
+                    style={{fontSize:'11px',padding:'6px 12px'}}
+                    onClick={handleImportFromEnv}
+                    title="Import keys from .env"
+                  >
+                    <Download size={13} style={{marginRight:'4px'}}/> Import from .env
+                  </button>
+                  <button
+                    className="primary"
+                    style={{fontSize:'11px',padding:'6px 12px'}}
+                    onClick={() => {
+                      setNewKeyProvider(filterCredProvider !== 'all' ? filterCredProvider : 'gemini');
+                      setNewKeyName('');
+                      setNewKeyVal('');
+                      setShowAddKeyModal(true);
+                    }}
+                  >
+                    <Plus size={13} style={{marginRight:'4px'}}/> Add API Key
+                  </button>
+                </div>
+              </div>
+
+              {/* Provider Filter Tabs */}
+              <div className="tabs" style={{marginBottom:'14px'}}>
+                <button
+                  className={filterCredProvider === 'all' ? 'on' : ''}
+                  onClick={() => setFilterCredProvider('all')}
+                >
+                  All Providers ({credentials.length})
+                </button>
+                <button
+                  className={filterCredProvider === 'gemini' ? 'on' : ''}
+                  onClick={() => setFilterCredProvider('gemini')}
+                >
+                  ✦ Google Gemini ({credentials.filter(c => c.provider === 'gemini').length})
+                </button>
+                <button
+                  className={filterCredProvider === 'groq' ? 'on' : ''}
+                  onClick={() => setFilterCredProvider('groq')}
+                >
+                  G Groq ({credentials.filter(c => c.provider === 'groq').length})
+                </button>
+                <button
+                  className={filterCredProvider === 'openrouter' ? 'on' : ''}
+                  onClick={() => setFilterCredProvider('openrouter')}
+                >
+                  ◈ OpenRouter ({credentials.filter(c => c.provider === 'openrouter').length})
+                </button>
+              </div>
+
+              {/* Security Banner */}
+              <div style={{
+                background:'#0f1520',
+                border:'1px solid #1e2838',
+                borderRadius:'6px',
+                padding:'8px 12px',
+                fontSize:'11px',
+                color:'#9fb1ca',
+                display:'flex',
+                alignItems:'center',
+                gap:'8px',
+                marginBottom:'14px'
+              }}>
+                <ShieldCheck size={14} color="#34d399"/>
+                <span>
+                  <strong>Windows DPAPI Secured:</strong> Keys are protected using Windows CryptProtectData tied to your local Windows user account. Decrypted secrets never leave backend memory and are never exposed over the network.
+                </span>
+              </div>
+
+              {/* Credentials List */}
+              {(() => {
+                let filtered = filterCredProvider === 'all'
+                  ? credentials
+                  : credentials.filter(c => c.provider === filterCredProvider);
+
+                if (filtered.length === 0) {
+                  return (
+                    <div style={{textAlign:'center',padding:'30px 10px',background:'#0b0f16',borderRadius:'8px',border:'1px dashed #232d3d'}}>
+                      <Key size={28} color="#4b5563" style={{marginBottom:'8px'}}/>
+                      <p style={{color:'#9ca3af',fontSize:'12px',margin:'0 0 10px 0'}}>
+                        No credentials configured for {filterCredProvider === 'all' ? 'any provider' : filterCredProvider}.
+                      </p>
+                      <div style={{display:'flex',justifyContent:'center',gap:'8px'}}>
+                        <button className="primary" style={{fontSize:'11px'}} onClick={() => { setNewKeyProvider(filterCredProvider === 'all' ? 'gemini' : filterCredProvider); setShowAddKeyModal(true); }}>
+                          <Plus size={12}/> Add First Key
+                        </button>
+                        <button className="secondary" style={{fontSize:'11px'}} onClick={handleImportFromEnv}>
+                          <Download size={12}/> Import Existing .env Keys
+                        </button>
+                      </div>
+                    </div>
+                  );
+                }
+
+                return (
+                  <div style={{display:'flex',flexDirection:'column',gap:'8px'}}>
+                    {filtered.map(c => {
+                      let testRes = credTestResults[c.id];
+                      let isTesting = testingCredId === c.id;
+
+                      return (
+                        <div
+                          key={c.id}
+                          style={{
+                            background: '#0d121a',
+                            border: c.is_primary ? '1px solid #3b82f6' : '1px solid #232d3d',
+                            borderRadius: '8px',
+                            padding: '12px 14px',
+                            display: 'flex',
+                            flexDirection: 'column',
+                            gap: '8px'
+                          }}
+                        >
+                          <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',flexWrap:'wrap',gap:'6px'}}>
+                            <div style={{display:'flex',alignItems:'center',gap:'8px'}}>
+                              <div className={'providerlogo ' + c.provider} style={{width:'22px',height:'22px',fontSize:'11px'}}>
+                                {c.provider === 'gemini' ? '✦' : c.provider === 'groq' ? 'G' : '◈'}
+                              </div>
+                              <b style={{fontSize:'13px',color:'#e1e7f2'}}>{c.key_name}</b>
+                              {c.is_primary && (
+                                <span className="status-badge executed" style={{background:'#193628',color:'#6ee7b7',display:'inline-flex',alignItems:'center',gap:'3px'}}>
+                                  <Star size={9}/> PRIMARY
+                                </span>
+                              )}
+                              <span className={
+                                'status-badge ' + (
+                                  !c.enabled ? 'expired' :
+                                  c.status === 'active' ? 'executed' :
+                                  c.status === 'cooldown' ? 'pending' : 'failed'
+                                )
+                              }>
+                                {!c.enabled ? '○ Disabled' :
+                                 c.status === 'active' ? '● Active' :
+                                 c.status === 'cooldown' ? `◷ Cooldown (${c.last_error_code || '429'})` :
+                                 '✕ Invalid (401)'}
+                              </span>
+                              {c.quota_scope && (
+                                <span style={{fontSize:'9px',background:'#1f2736',color:'#93c5fd',padding:'2px 6px',borderRadius:'4px'}}>
+                                  Scope: {c.quota_scope}
+                                </span>
+                              )}
+                            </div>
+
+                            <div style={{display:'flex',alignItems:'center',gap:'6px'}}>
+                              <button
+                                className="secondary"
+                                style={{fontSize:'10px',padding:'4px 8px'}}
+                                onClick={() => handleTestCredential(c.id)}
+                                disabled={isTesting}
+                                title="Run lightweight metadata test"
+                              >
+                                <Zap size={11} style={{marginRight:'3px'}}/>
+                                {isTesting ? 'Testing...' : 'Test Connection'}
+                              </button>
+
+                              {!c.is_primary && c.enabled && (
+                                <button
+                                  className="secondary"
+                                  style={{fontSize:'10px',padding:'4px 8px'}}
+                                  onClick={() => handleSetPrimary(c.id)}
+                                  title="Designate as primary key"
+                                >
+                                  <Star size={11} style={{marginRight:'3px'}}/> Make Primary
+                                </button>
+                              )}
+
+                              <button
+                                className="secondary"
+                                style={{fontSize:'10px',padding:'4px 8px'}}
+                                onClick={() => handleToggleEnable(c.id, c.enabled)}
+                                title={c.enabled ? 'Disable key' : 'Enable key'}
+                              >
+                                {c.enabled ? 'Disable' : 'Enable'}
+                              </button>
+
+                              <div style={{display:'flex',gap:'2px'}}>
+                                <button
+                                  className="secondary"
+                                  style={{padding:'4px 6px',fontSize:'9px'}}
+                                  onClick={() => handleMovePriority(c.provider, c.id, 'up')}
+                                  title="Increase priority order"
+                                >
+                                  <ArrowUp size={11}/>
+                                </button>
+                                <button
+                                  className="secondary"
+                                  style={{padding:'4px 6px',fontSize:'9px'}}
+                                  onClick={() => handleMovePriority(c.provider, c.id, 'down')}
+                                  title="Decrease priority order"
+                                >
+                                  <ArrowDown size={11}/>
+                                </button>
+                              </div>
+
+                              <button
+                                className="secondary"
+                                style={{fontSize:'10px',padding:'4px 8px',color:'#f87171'}}
+                                onClick={() => handleDeleteCredential(c.id, c.key_name, c.is_primary)}
+                                title="Delete credential"
+                              >
+                                <Trash2 size={11}/>
+                              </button>
+                            </div>
+                          </div>
+
+                          <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',flexWrap:'wrap',gap:'6px',fontSize:'11px',color:'#8fa8d6'}}>
+                            <div style={{display:'flex',alignItems:'center',gap:'12px'}}>
+                              <span>Masked secret: <code style={{color:'#e1e7f2',fontFamily:'monospace',fontSize:'11px'}}>{c.masked_key}</code></span>
+                              <span>Priority: <b>#{c.priority}</b></span>
+                              {c.consecutive_failures > 0 && <span style={{color:'#f87171'}}>Failures: {c.consecutive_failures}</span>}
+                              {c.last_used_at && <span>Last used: {new Date(c.last_used_at).toLocaleTimeString()}</span>}
+                            </div>
+
+                            {testRes && (
+                              <div style={{
+                                fontSize:'10px',
+                                padding:'2px 8px',
+                                borderRadius:'4px',
+                                background: testRes.ok ? '#14291f' : '#2d1418',
+                                color: testRes.ok ? '#86efac' : '#fca5a5'
+                              }}>
+                                {testRes.ok ? `✓ Verified (${testRes.latency_ms} ms)` : `✕ ${testRes.error || 'Failed'}`}
+                              </div>
+                            )}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                );
+              })()}
             </div>
 
             <div className="panel" style={{marginTop:'16px'}}>

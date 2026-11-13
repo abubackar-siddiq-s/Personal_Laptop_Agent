@@ -70,6 +70,44 @@ def init_db():
         );
         """)
         c.execute("""
+        CREATE TABLE IF NOT EXISTS provider_credentials (
+            id TEXT PRIMARY KEY,
+            provider TEXT NOT NULL,
+            key_name TEXT NOT NULL,
+            encrypted_key TEXT NOT NULL,
+            key_fingerprint TEXT NOT NULL,
+            masked_key TEXT NOT NULL,
+            priority INTEGER DEFAULT 1,
+            is_primary INTEGER DEFAULT 0,
+            enabled INTEGER DEFAULT 1,
+            status TEXT DEFAULT 'active',
+            last_used_at TEXT,
+            last_success_at TEXT,
+            last_error_at TEXT,
+            consecutive_failures INTEGER DEFAULT 0,
+            cooldown_until TEXT,
+            last_error_code TEXT,
+            quota_scope TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+        """)
+        c.execute("CREATE INDEX IF NOT EXISTS idx_provider_creds ON provider_credentials(provider, enabled, priority);")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_provider_fingerprint ON provider_credentials(provider, key_fingerprint);")
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS provider_telemetry (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            provider TEXT NOT NULL,
+            credential_id TEXT,
+            event_type TEXT NOT NULL,
+            model TEXT,
+            latency_ms REAL,
+            error_message TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+        """)
+        c.execute("CREATE INDEX IF NOT EXISTS idx_provider_telem_prov ON provider_telemetry(provider, created_at);")
+        c.execute("""
         CREATE TABLE IF NOT EXISTS mcp_servers(
             id TEXT PRIMARY KEY,
             name TEXT NOT NULL,

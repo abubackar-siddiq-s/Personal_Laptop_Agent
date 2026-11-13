@@ -309,8 +309,194 @@ def save_key(b: Key):
     elif b.provider == "openrouter":
         settings.openrouter_api_key = clean_key
 
+    try:
+        from app.core.credential_manager import CredentialManager
+        CredentialManager.add_credential(
+            provider=b.provider,
+            key_name=f"{b.provider.capitalize()} Default Key",
+            api_key=clean_key,
+            priority=10,
+            is_primary=True,
+        )
+    except Exception:
+        pass
+
     audit("provider.key_saved", b.provider)
     return {"ok": True, "message": "Saved locally and activated."}
+
+
+# ---------------------------------------------------------
+# Multi-Key API Backup & Automatic Rotation Endpoints
+# ---------------------------------------------------------
+
+class CredentialCreateReq(BaseModel):
+    provider: str
+    key_name: str
+    api_key: str
+    priority: int = 100
+    is_primary: bool = False
+    quota_scope: str | None = None
+
+
+class CredentialUpdateReq(BaseModel):
+    key_name: str | None = None
+    priority: int | None = None
+    quota_scope: str | None = None
+
+
+class CredentialReorderReq(BaseModel):
+    provider: str
+    ordered_ids: list[str]
+
+
+class CredentialTestRawReq(BaseModel):
+    provider: str
+    api_key: str
+
+
+@r.get("/providers/credentials")
+def list_provider_credentials(provider: str | None = None):
+    from app.core.credential_manager import CredentialManager
+    creds = CredentialManager.list_credentials(provider=provider)
+    return {"credentials": creds}
+
+
+@r.post("/providers/credentials")
+def create_provider_credential(b: CredentialCreateReq):
+    from app.core.credential_manager import CredentialManager
+    if b.provider not in ("gemini", "groq", "openrouter"):
+        raise HTTPException(400, "Invalid provider. Supported: gemini, groq, openrouter")
+    clean_key = b.api_key.strip("'\" \t\r\n")
+    if len(clean_key) < 8:
+        raise HTTPException(400, "API key must be at least 8 characters.")
+    clean_name = b.key_name.strip()
+    if not clean_name:
+        clean_name = f"{b.provider.capitalize()} Key"
+
+    try:
+        cred = CredentialManager.add_credential(
+            provider=b.provider,
+            key_name=clean_name,
+            api_key=clean_key,
+            priority=b.priority,
+            is_primary=b.is_primary,
+            quota_scope=b.quota_scope.strip() if b.quota_scope else None,
+        )
+        audit("provider.credential_created", f"provider={b.provider}, id={cred['id']}, name={clean_name}")
+        return {"ok": True, "credential": cred}
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except Exception as e:
+        raise HTTPException(500, f"Failed to save credential: {e}")
+
+
+@r.put("/providers/credentials/{credential_id}")
+def update_provider_credential(credential_id: str, b: CredentialUpdateReq):
+    from app.core.credential_manager import CredentialManager
+    try:
+        cred = CredentialManager.update_credential(
+            credential_id=credential_id,
+            key_name=b.key_name.strip() if b.key_name is not None else None,
+            priority=b.priority,
+            quota_scope=b.quota_scope.strip() if b.quota_scope is not None else None,
+        )
+        audit("provider.credential_updated", f"id={credential_id}")
+        return {"ok": True, "credential": cred}
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+    except Exception as e:
+        raise HTTPException(500, f"Failed to update credential: {e}")
+
+
+@r.delete("/providers/credentials/{credential_id}")
+def delete_provider_credential(credential_id: str):
+    from app.core.credential_manager import CredentialManager
+    try:
+        res = CredentialManager.delete_credential(credential_id)
+        audit("provider.credential_deleted", f"id={credential_id}")
+        return {"ok": True, "result": res}
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+    except Exception as e:
+        raise HTTPException(500, f"Failed to delete credential: {e}")
+
+
+@r.post("/providers/credentials/{credential_id}/test")
+async def test_provider_credential(credential_id: str):
+    from app.core.credential_manager import CredentialManager
+    res = await CredentialManager.test_credential(credential_id)
+    audit("provider.credential_tested", f"id={credential_id}, ok={res.get('ok')}")
+    return res
+
+
+@r.post("/providers/credentials/test-raw")
+async def test_raw_provider_credential(b: CredentialTestRawReq):
+    from app.core.credential_manager import CredentialManager
+    if b.provider not in ("gemini", "groq", "openrouter"):
+        raise HTTPException(400, "Invalid provider. Supported: gemini, groq, openrouter")
+    clean_key = b.api_key.strip("'\" \t\r\n")
+    if len(clean_key) < 8:
+        raise HTTPException(400, "API key must be at least 8 characters.")
+    res = await CredentialManager.test_raw_key(b.provider, clean_key)
+    return res
+
+
+@r.post("/providers/credentials/{credential_id}/enable")
+def enable_provider_credential(credential_id: str):
+    from app.core.credential_manager import CredentialManager
+    try:
+        cred = CredentialManager.enable_credential(credential_id)
+        audit("provider.credential_enabled", f"id={credential_id}")
+        return {"ok": True, "credential": cred}
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+
+
+@r.post("/providers/credentials/{credential_id}/disable")
+def disable_provider_credential(credential_id: str):
+    from app.core.credential_manager import CredentialManager
+    try:
+        cred = CredentialManager.disable_credential(credential_id)
+        audit("provider.credential_disabled", f"id={credential_id}")
+        return {"ok": True, "credential": cred}
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+
+
+@r.post("/providers/credentials/{credential_id}/set-primary")
+def set_primary_provider_credential(credential_id: str):
+    from app.core.credential_manager import CredentialManager
+    try:
+        cred = CredentialManager.set_primary(credential_id)
+        audit("provider.credential_set_primary", f"id={credential_id}")
+        return {"ok": True, "credential": cred}
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+
+
+@r.post("/providers/credentials/reorder")
+def reorder_provider_credentials(b: CredentialReorderReq):
+    from app.core.credential_manager import CredentialManager
+    if b.provider not in ("gemini", "groq", "openrouter"):
+        raise HTTPException(400, "Invalid provider. Supported: gemini, groq, openrouter")
+    res = CredentialManager.reorder_credentials(b.provider, b.ordered_ids)
+    audit("provider.credentials_reordered", f"provider={b.provider}, count={len(b.ordered_ids)}")
+    return {"ok": True, "credentials": res}
+
+
+@r.get("/providers/credentials/health")
+def provider_credentials_health(provider: str | None = None):
+    from app.core.credential_manager import CredentialManager
+    metrics = CredentialManager.get_health_metrics(provider=provider)
+    return {"ok": True, "metrics": metrics}
+
+
+@r.post("/providers/credentials/import-env")
+def import_env_provider_credentials():
+    from app.core.credential_manager import CredentialManager
+    res = CredentialManager.import_env_credentials()
+    audit("provider.credentials_imported_env", f"imported={res.get('imported')}")
+    return {"ok": True, "result": res}
 
 
 @r.post("/chat")

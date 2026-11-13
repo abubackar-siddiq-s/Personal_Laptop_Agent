@@ -1,5 +1,6 @@
 from __future__ import annotations
 import asyncio
+import time
 import json
 import logging
 import random
@@ -21,7 +22,37 @@ class RateLimitError(RuntimeError):
         self.wait_seconds = wait_seconds
 
 
+class AuthError(RuntimeError):
+    """Raised when an API key fails authentication (HTTP 401)."""
+    def __init__(self, provider: str, message: str):
+        super().__init__(message)
+        self.provider = provider
+
+
+class KeyRateLimitError(RateLimitError):
+    """Raised when a specific API key encounters a 429 rate limit."""
+    def __init__(self, provider: str, model: str, wait_seconds: float, is_shared_quota: bool, message: str):
+        super().__init__(provider=provider, model=model, wait_seconds=wait_seconds, message=message)
+        self.is_shared_quota = is_shared_quota
+
+
+class ProviderServerError(RuntimeError):
+    """Raised when provider returns HTTP 5xx or server-side error."""
+    def __init__(self, status_code: int, message: str):
+        super().__init__(message)
+        self.status_code = status_code
+
+
 def get_key(provider: str) -> str:
+    """Get active API key for provider from CredentialManager, falling back to environment settings."""
+    try:
+        from app.core.credential_manager import CredentialManager
+        cred = CredentialManager.get_eligible_credential(provider)
+        if cred:
+            return cred[1]
+    except Exception:
+        pass
+
     key = {
         "gemini": settings.gemini_api_key,
         "groq": settings.groq_api_key,
@@ -31,13 +62,31 @@ def get_key(provider: str) -> str:
 
 
 def status() -> dict:
-    return {
-        k: {
-            "configured": bool(get_key(k)),
-            "masked_key": ("••••" + get_key(k)[-4:] if len(get_key(k)) >= 4 else ""),
+    st = {}
+    try:
+        from app.core.credential_manager import CredentialManager
+        for k in ["gemini", "groq", "openrouter"]:
+            active_key = get_key(k)
+            creds = CredentialManager.list_credentials(k)
+            primary = next((c for c in creds if c["is_primary"]), None)
+            active_count = sum(1 for c in creds if c["enabled"] and c["status"] == "active")
+            st[k] = {
+                "configured": bool(active_key),
+                "masked_key": primary["masked_key"] if primary else ("••••" + active_key[-4:] if len(active_key) >= 4 else ""),
+                "configured_keys_count": len(creds),
+                "active_keys_count": active_count,
+                "has_backup_keys": active_count > 1,
+                "primary_label": primary["key_name"] if primary else ("Environment Variable" if active_key else None),
+            }
+        return st
+    except Exception:
+        return {
+            k: {
+                "configured": bool(get_key(k)),
+                "masked_key": ("••••" + get_key(k)[-4:] if len(get_key(k)) >= 4 else ""),
+            }
+            for k in ["gemini", "groq", "openrouter"]
         }
-        for k in ["gemini", "groq", "openrouter"]
-    }
 
 
 def is_vision_capable(provider: str, model: str) -> bool:
@@ -79,18 +128,81 @@ async def chat_turn(
     system_instruction: str = "",
     timeout: float = 60.0,
 ) -> TurnResult:
-    """Execute a single conversational turn supporting tools across all 3 providers."""
-    key = get_key(provider)
-    if not key:
-        raise RuntimeError(f"{provider.capitalize()} API key is not configured in backend/.env")
+    """Execute a single conversational turn with automatic multi-key rotation and provider error classification."""
+    p = provider.lower().strip()
+    if p not in ("gemini", "groq", "openrouter"):
+        raise ValueError(f"Unsupported provider: '{provider}'")
+
+    from app.core.credential_manager import CredentialManager
+
+    tried_credential_ids: list[str] = []
+    max_key_attempts = 4
 
     async with httpx.AsyncClient(timeout=timeout) as client:
-        if provider == "gemini":
-            return await _gemini_turn(client, model, key, messages, tools, system_instruction)
-        elif provider in ("groq", "openrouter"):
-            return await _openai_compatible_turn(client, provider, model, key, messages, tools, system_instruction)
-        else:
-            raise ValueError(f"Unsupported provider: '{provider}'")
+        while len(tried_credential_ids) < max_key_attempts:
+            cred_selection = CredentialManager.get_eligible_credential(p, exclude_ids=tried_credential_ids)
+            if not cred_selection:
+                if not tried_credential_ids:
+                    raise RuntimeError(f"{provider.capitalize()} API key is not configured in backend/.env or credential store.")
+                break
+
+            cred_id, key = cred_selection
+            t0 = time.perf_counter()
+
+            try:
+                if p == "gemini":
+                    res = await _gemini_turn(client, model, key, messages, tools, system_instruction)
+                else:
+                    res = await _openai_compatible_turn(client, p, model, key, messages, tools, system_instruction)
+
+                latency_ms = round((time.perf_counter() - t0) * 1000, 2)
+                CredentialManager.record_success(cred_id, model=model, latency_ms=latency_ms)
+                return res
+
+            except AuthError as e:
+                logger.warning("Provider %s key '%s' failed authentication (401). Rotating to next key...", p, cred_id)
+                audit("credential.auth_failed_rotation", f"{p} {cred_id} failed 401, rotating to backup")
+                CredentialManager.record_failure(cred_id, error_code="401", is_auth_failure=True, model=model, error_message=str(e))
+                tried_credential_ids.append(cred_id)
+                continue
+
+            except KeyRateLimitError as e:
+                wait_sec = e.wait_seconds
+                is_shared = e.is_shared_quota
+                logger.warning(
+                    "Provider %s key '%s' rate-limited (429, wait=%.1fs, shared=%s). Evaluating backup keys...",
+                    p, cred_id, wait_sec, is_shared
+                )
+                CredentialManager.record_failure(
+                    cred_id, error_code="429", wait_seconds=wait_sec,
+                    quota_scope_cooldown=is_shared, model=model, error_message=str(e)
+                )
+                tried_credential_ids.append(cred_id)
+
+                # Check if independent backup key exists that is not in cooldown
+                next_cand = CredentialManager.get_eligible_credential(p, exclude_ids=tried_credential_ids)
+                if next_cand and not is_shared:
+                    logger.info("Rotating to backup key '%s' for %s...", next_cand[0], p)
+                    audit("credential.rate_limit_rotation", f"{p} rotated from {cred_id} to {next_cand[0]}")
+                    continue
+                else:
+                    # No other eligible independent key; raise RateLimitError to trigger provider-level fallback
+                    raise RateLimitError(provider=p, model=model, wait_seconds=wait_sec, message=str(e))
+
+            except ProviderServerError as e:
+                logger.warning("Provider %s key '%s' server error: %s", p, cred_id, e)
+                CredentialManager.record_failure(cred_id, error_code=str(e.status_code), model=model, error_message=str(e))
+                tried_credential_ids.append(cred_id)
+                next_cand = CredentialManager.get_eligible_credential(p, exclude_ids=tried_credential_ids)
+                if next_cand:
+                    continue
+                raise RuntimeError(str(e))
+
+            except Exception:
+                # Do NOT rotate keys for non-credential errors (e.g. invalid arguments, unsupported model)
+                raise
+
+    raise RuntimeError(f"All configured credentials for {provider.capitalize()} were exhausted or unavailable.")
 
 
 async def _openai_compatible_turn(
@@ -155,6 +267,16 @@ async def _openai_compatible_turn(
 
     for attempt in range(max_retries + 1):
         r = await client.post(url, headers=headers, json=payload)
+        if r.status_code == 401:
+            err_msg = r.text
+            try:
+                err_json = r.json()
+                if "error" in err_json and isinstance(err_json["error"], dict):
+                    err_msg = err_json["error"].get("message", r.text)
+            except Exception:
+                pass
+            raise AuthError(provider=provider, message=f"Authentication failed (HTTP 401): {err_msg}")
+
         if r.status_code == 429:
             err_msg = r.text
             try:
@@ -165,7 +287,7 @@ async def _openai_compatible_turn(
                 pass
 
             wait_sec = parse_rate_limit_reset(r.headers, r.text)
-            if attempt < max_retries and wait_sec <= 10.0:
+            if attempt < max_retries and wait_sec <= 2.0:
                 jitter = random.uniform(0.1, 0.4)
                 actual_sleep = wait_sec + jitter
                 logger.warning(
@@ -177,7 +299,18 @@ async def _openai_compatible_turn(
                 continue
             else:
                 audit("provider.rate_limit_exhausted", f"{provider} 429 limit reached: {err_msg}")
-                raise RateLimitError(provider=provider, model=model, wait_seconds=wait_sec, message=err_msg)
+                is_shared = any(term in err_msg.lower() for term in ("organization", "project", "tier limit", "org_id", "project_quota", "account limit"))
+                raise KeyRateLimitError(provider=provider, model=model, wait_seconds=wait_sec, is_shared_quota=is_shared, message=err_msg)
+
+        if r.status_code in (500, 502, 503, 504):
+            err_msg = r.text
+            try:
+                err_json = r.json()
+                if "error" in err_json and isinstance(err_json["error"], dict):
+                    err_msg = err_json["error"].get("message", r.text)
+            except Exception:
+                pass
+            raise ProviderServerError(status_code=r.status_code, message=f"{provider.capitalize()} server error ({r.status_code}): {err_msg}")
 
         if r.status_code != 200:
             err_msg = r.text
@@ -266,6 +399,16 @@ async def _gemini_turn(
 
     for attempt in range(max_retries + 1):
         r = await client.post(url, json=payload)
+        if r.status_code == 401 or (r.status_code in (400, 403) and any(term in r.text for term in ("API_KEY_INVALID", "API key not valid", "PERMISSION_DENIED"))):
+            err_msg = r.text
+            try:
+                err_json = r.json()
+                if "error" in err_json and isinstance(err_json["error"], dict):
+                    err_msg = err_json["error"].get("message", r.text)
+            except Exception:
+                pass
+            raise AuthError(provider="gemini", message=f"Gemini authentication failed (HTTP {r.status_code}): {err_msg}")
+
         if r.status_code == 429:
             err_msg = r.text
             try:
@@ -276,7 +419,7 @@ async def _gemini_turn(
                 pass
 
             wait_sec = parse_rate_limit_reset(r.headers, r.text)
-            if attempt < max_retries and wait_sec <= 10.0:
+            if attempt < max_retries and wait_sec <= 2.0:
                 jitter = random.uniform(0.1, 0.4)
                 actual_sleep = wait_sec + jitter
                 logger.warning(
@@ -288,7 +431,18 @@ async def _gemini_turn(
                 continue
             else:
                 audit("provider.rate_limit_exhausted", f"gemini 429 limit reached: {err_msg}")
-                raise RateLimitError(provider="gemini", model=clean_model, wait_seconds=wait_sec, message=err_msg)
+                is_shared = any(term in err_msg.lower() for term in ("project", "quota exceeded for project", "tier limit"))
+                raise KeyRateLimitError(provider="gemini", model=clean_model, wait_seconds=wait_sec, is_shared_quota=is_shared, message=err_msg)
+
+        if r.status_code in (500, 502, 503, 504):
+            err_msg = r.text
+            try:
+                err_json = r.json()
+                if "error" in err_json and isinstance(err_json["error"], dict):
+                    err_msg = err_json["error"].get("message", r.text)
+            except Exception:
+                pass
+            raise ProviderServerError(status_code=r.status_code, message=f"Gemini server error ({r.status_code}): {err_msg}")
 
         if r.status_code != 200:
             err_msg = r.text
